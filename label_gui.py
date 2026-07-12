@@ -427,8 +427,9 @@ def build_label_image(data, settings):
     draw_thai_text(draw, (x, y), dose_text, dose_font, fill=0)
     y += 38
 
-    line2_font = fit_font(draw, line2, label_w_px - 2 * x, 24, bold=True)
+    line2_font = fit_font(draw, line2, label_w_px - 2 * x - QTY_RESERVED_W - 10, 24, bold=True)
     draw_thai_text(draw, (x, y), line2, line2_font, fill=0)
+    dotted_field("EXP", label_w_px - x - QTY_RESERVED_W, y + 4, QTY_RESERVED_W)
     y += 40
 
     extra = data.get("extra_labels") or []
