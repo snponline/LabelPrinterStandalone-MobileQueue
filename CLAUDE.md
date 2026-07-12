@@ -70,6 +70,23 @@ per-conversation).
   serving stale content). If a live test ever looks inexplicably stale, check `tasklist` for a
   leftover `LabelPrinter.exe` before assuming the code is wrong.
 
+## Version history
+
+`APP_VERSION` in `label_gui.py` (shown in the window title bar) — bump it whenever a commit ships
+a user-visible feature/fix batch, since there's no other version indicator in this app.
+
+- **1.1.0** — patient profile feature (`patients`/`patient_documents` tables; search by
+  name/phone; allergy notes; upload/view/delete document photos, desktop + mobile); "แพ้ยา"
+  allergy checkbox (main screen + mobile page) that switches the label's warning-line suffix
+  between underlined "ไม่แพ้ยา" and "แพ้ยา:ดูแฟ้ม", flows through the mobile print queue so the
+  desktop auto-ticks it on claim; pharmacist name moved to its own label line aligned under
+  "ให้นมบุตร" for longer names; assorted UX fixes (prefix-priority patient search, bigger
+  upload-note dialog, inline per-row view/delete on document lists, resized patient dialog to fit
+  the screen). PDF guides updated with a summary page each.
+- **(unversioned baseline)** — everything in the initial commit (`fec6136`): mobile print queue,
+  usage-mode label rendering (กิน/ทา/หยอด), print-history dialog, Excel import, Export/Import
+  backup.
+
 ## Testing pattern used throughout this project
 
 Prefer testing via **direct function calls** (`storage.*`, `local_server.build_search_results()`,

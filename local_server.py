@@ -11,6 +11,7 @@ tradeoff for a given shop, this is the place to add a shared PIN check.
 """
 import json
 import os
+import re
 import socket
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -85,6 +86,42 @@ def build_search_results(term):
     return out
 
 
+def parse_multipart(content_type, body):
+    """Minimal multipart/form-data parser - Python's stdlib `cgi` module
+    (which used to handle this) was removed in 3.13. We fully control both
+    ends (the mobile page's own upload form), so this only needs to handle
+    the shapes a normal browser FormData upload actually produces, not every
+    edge case in RFC 2388. Returns (fields: {name: str}, files: {name: bytes}).
+    """
+    m = re.search(r"boundary=([^;]+)", content_type)
+    if not m:
+        return {}, {}
+    boundary = m.group(1).strip('"').encode()
+    fields, files = {}, {}
+    for part in body.split(b"--" + boundary):
+        part = part.strip(b"\r\n")
+        if not part or part == b"--":
+            continue
+        header_end = part.find(b"\r\n\r\n")
+        if header_end == -1:
+            continue
+        headers_raw = part[:header_end].decode("utf-8", errors="replace")
+        content = part[header_end + 4:]
+        if content.endswith(b"\r\n"):
+            content = content[:-2]
+        name_m = re.search(r'name="([^"]*)"', headers_raw)
+        if not name_m:
+            continue
+        field_name = name_m.group(1)
+        filename_m = re.search(r'filename="([^"]*)"', headers_raw)
+        if filename_m:
+            if filename_m.group(1):  # empty filename = no file actually chosen
+                files[field_name] = content
+        else:
+            fields[field_name] = content.decode("utf-8", errors="replace")
+    return fields, files
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass  # keep this quiet - fires on every phone request
@@ -101,6 +138,20 @@ class Handler(BaseHTTPRequestHandler):
         body = html.encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_file(self, path, content_type="image/jpeg"):
+        try:
+            with open(path, "rb") as f:
+                body = f.read()
+        except OSError:
+            self.send_response(404)
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -153,6 +204,43 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/api/staff":
             self._send_json(storage.list_staff_names())
 
+        elif parsed.path == "/api/patients":
+            q = qs.get("q", [""])[0].strip()
+            self._send_json(storage.search_patients(q) if q else [])
+
+        elif parsed.path == "/api/patient":
+            try:
+                patient_id = int(qs.get("id", [""])[0])
+            except (ValueError, IndexError):
+                self._send_json({"ok": False, "message": "รหัสผู้ป่วยไม่ถูกต้อง"}, 400)
+                return
+            patient = storage.get_patient(patient_id)
+            if not patient:
+                self._send_json({"ok": False, "message": "ไม่พบผู้ป่วย"}, 404)
+                return
+            jobs = storage.list_print_jobs_for_patient(patient["name"], patient["phone"])
+            docs = storage.list_patient_documents(patient_id)
+            self._send_json({"ok": True, "patient": patient, "jobs": jobs, "documents": docs})
+
+        elif parsed.path.startswith("/patient_docs/"):
+            # /patient_docs/<patient_id>/<filename> - patient_id forced to int
+            # and filename reduced to its basename so this can never escape
+            # PATIENT_DOCS_DIR (no path traversal via ../../ etc.)
+            parts = parsed.path.split("/")
+            if len(parts) != 4:
+                self.send_response(404)
+                self.end_headers()
+                return
+            try:
+                patient_id = int(parts[2])
+            except ValueError:
+                self.send_response(404)
+                self.end_headers()
+                return
+            filename = os.path.basename(parts[3])
+            full_path = os.path.join(storage.PATIENT_DOCS_DIR, str(patient_id), filename)
+            self._send_file(full_path)
+
         else:
             self.send_response(404)
             self.end_headers()
@@ -169,6 +257,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             job_id = storage.add_queue_job(
                 body.get("patient_name", ""), body.get("customer_phone", ""), drugs,
+                has_allergy=bool(body.get("has_allergy")),
             )
             self._send_json({"ok": True, "id": job_id})
 
@@ -188,6 +277,52 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"ok": False, "message": "ไม่พบรหัสพนักงาน"}, 400)
                 return
             storage.delete_staff_name(staff_id)
+            self._send_json({"ok": True})
+
+        elif self.path == "/api/patient_create":
+            body = self._read_json_body() or {}
+            patient_id = storage.find_or_create_patient(body.get("name", ""), body.get("phone", ""))
+            if patient_id is None:
+                self._send_json({"ok": False, "message": "กรุณาใส่ชื่อหรือเบอร์โทรอย่างน้อยหนึ่งอย่าง"}, 400)
+                return
+            self._send_json({"ok": True, "id": patient_id})
+
+        elif self.path == "/api/patient_allergy":
+            body = self._read_json_body() or {}
+            patient_id = body.get("id")
+            if not patient_id:
+                self._send_json({"ok": False, "message": "ไม่พบรหัสผู้ป่วย"}, 400)
+                return
+            storage.update_patient_allergy(patient_id, body.get("allergy_note", ""))
+            self._send_json({"ok": True})
+
+        elif self.path == "/api/patient_upload":
+            length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(length) if length else b""
+            fields, files = parse_multipart(self.headers.get("Content-Type", ""), raw)
+            try:
+                patient_id = int(fields.get("patient_id", ""))
+            except ValueError:
+                self._send_json({"ok": False, "message": "ไม่พบรหัสผู้ป่วย"}, 400)
+                return
+            image_bytes = files.get("image")
+            if not image_bytes:
+                self._send_json({"ok": False, "message": "กรุณาเลือกรูปภาพ"}, 400)
+                return
+            try:
+                storage.add_patient_document(patient_id, image_bytes, fields.get("note", ""))
+            except Exception as e:
+                self._send_json({"ok": False, "message": f"อัปโหลดไม่สำเร็จ: {e}"}, 400)
+                return
+            self._send_json({"ok": True})
+
+        elif self.path == "/api/patient_doc_delete":
+            body = self._read_json_body() or {}
+            doc_id = body.get("id")
+            if not doc_id:
+                self._send_json({"ok": False, "message": "ไม่พบรหัสเอกสาร"}, 400)
+                return
+            storage.delete_patient_document(doc_id)
             self._send_json({"ok": True})
 
         else:
@@ -262,11 +397,32 @@ QUEUE_PAGE_HTML = r"""<!DOCTYPE html>
   .section-title { font-size:14px; font-weight:700; color:var(--muted); margin-bottom:8px; }
   .selected-header { display:flex; align-items:center; justify-content:space-between; }
   .selected-header .section-title { margin-bottom:8px; }
-  #clear-all-btn { background:none; border:none; color:var(--danger); font-size:13px; font-weight:700; cursor:pointer; padding:4px 0 8px; }
+  #clear-all-btn { background:none; border:none; color:var(--danger); font-size:17px; font-weight:700; cursor:pointer; padding:4px 0 8px; }
   #clear-all-btn:active { opacity:.6; }
+  #allergy-toggle { display:flex; align-items:center; gap:4px; font-size:17px; font-weight:700; color:var(--danger); cursor:pointer; padding:4px 8px 8px 0; }
+  #allergy-toggle input { width:16px; height:16px; }
 
-  #fav-open-btn { width:100%; padding:12px; font-size:15px; font-weight:700; color:var(--primary); background:#fff; border:1.5px solid var(--primary); border-radius:10px; cursor:pointer; }
-  #fav-open-btn:active { background:var(--bg); }
+  #fav-open-btn, #patient-open-btn { width:100%; padding:12px; font-size:15px; font-weight:700; color:var(--primary); background:#fff; border:1.5px solid var(--primary); border-radius:10px; cursor:pointer; }
+  #fav-open-btn:active, #patient-open-btn:active { background:var(--bg); }
+
+  .patient-detail { display:none; margin-top:14px; border-top:1px solid var(--border); padding-top:12px; }
+  .patient-detail-name { font-size:17px; font-weight:700; color:var(--primary); margin-bottom:8px; }
+  .patient-section-title { font-weight:700; font-size:13px; margin-bottom:4px; }
+  #patient-allergy-input { width:100%; padding:8px; border:1.5px solid var(--border); border-radius:8px; font-family:inherit; font-size:14px; resize:vertical; }
+  .patient-save-btn { margin:6px 0 14px; padding:9px 14px; background:var(--primary); color:#fff; border:none; border-radius:8px; font-weight:700; cursor:pointer; }
+  .purchase-item { padding:8px 0; border-bottom:1px solid var(--border); font-size:13px; }
+  .doc-header-row { display:flex; justify-content:space-between; align-items:center; }
+  .doc-upload-btn { padding:7px 12px; background:#1a5a9a; color:#fff; border:none; border-radius:8px; font-size:12px; font-weight:700; cursor:pointer; }
+  .doc-item { display:flex; gap:10px; align-items:center; padding:8px 0; border-bottom:1px solid var(--border); }
+  .doc-thumb { width:42px; height:42px; object-fit:cover; border-radius:6px; border:1px solid var(--border); flex-shrink:0; }
+  .doc-note { flex:1; font-size:10px; min-width:0; overflow-wrap:break-word; word-break:break-word; }
+  .upload-preview-box { border:1.5px dashed var(--border); border-radius:10px; padding:10px; margin-top:8px; }
+  .upload-preview-box img { max-width:100%; max-height:160px; display:block; margin:0 auto 8px; border-radius:6px; }
+  #patient-upload-note { width:100%; padding:8px; border:1.5px solid var(--border); border-radius:8px; font-family:inherit; font-size:13px; resize:vertical; margin-bottom:8px; box-sizing:border-box; }
+  .upload-btn-row { display:flex; gap:8px; }
+  .upload-save-btn { flex:1; padding:9px; background:var(--primary); color:#fff; border:none; border-radius:8px; font-weight:700; cursor:pointer; }
+  .upload-cancel-btn { flex:1; padding:9px; background:#e5e7eb; color:var(--text); border:none; border-radius:8px; font-weight:700; cursor:pointer; }
+  .doc-del-btn { background:none; border:none; color:var(--danger); font-size:20px; cursor:pointer; padding:4px; }
 
   #search-input { width:100%; padding:14px; font-size:17px; border:1.5px solid var(--border); border-radius:10px; }
   #search-input:focus { outline:none; border-color:var(--primary); }
@@ -349,6 +505,10 @@ QUEUE_PAGE_HTML = r"""<!DOCTYPE html>
     <button id="fav-open-btn" onclick="openFavPicker()">⭐ โหลดจาก Favorite</button>
   </div>
 
+  <div class="section" style="padding-top:8px;">
+    <button id="patient-open-btn" onclick="openPatientDialog()">🗂 ประวัติผู้ป่วย</button>
+  </div>
+
   <div class="section">
     <div class="section-title">ค้นหายา</div>
     <input type="text" id="search-input" placeholder="พิมพ์ชื่อยา..." autocomplete="off">
@@ -358,6 +518,7 @@ QUEUE_PAGE_HTML = r"""<!DOCTYPE html>
   <div class="section">
     <div class="selected-header">
       <div class="section-title">รายการที่เลือก (<span id="selected-count">0</span>)</div>
+      <label id="allergy-toggle"><input type="checkbox" id="allergy-checkbox"> ⚠ แพ้ยา</label>
       <button id="clear-all-btn" onclick="clearAllSelected()">ล้างทั้งหมด</button>
     </div>
     <div id="selected-list"></div>
@@ -373,6 +534,46 @@ QUEUE_PAGE_HTML = r"""<!DOCTYPE html>
     <h3>⭐ เลือก Favorite</h3>
     <div id="fav-list"></div>
     <button class="modal-close-btn" onclick="closeFavPicker()">ปิด</button>
+  </div>
+</div>
+
+<div class="overlay" id="patient-overlay" onclick="if(event.target===this) closePatientDialog()">
+  <div class="modal-card" style="max-width:480px;">
+    <h3>🗂 ประวัติผู้ป่วย</h3>
+    <div style="display:flex; gap:8px; margin-bottom:8px;">
+      <input type="text" id="patient-search-input" placeholder="ค้นหาชื่อ/เบอร์โทร" style="flex:1; padding:12px; font-size:15px; border:1.5px solid var(--border); border-radius:10px;">
+      <button onclick="clearPatientSearch()" style="padding:0 14px; background:#555; color:#fff; border:none; border-radius:10px; font-weight:700;">✕</button>
+      <button onclick="searchPatients()" style="padding:0 16px; background:var(--primary); color:#fff; border:none; border-radius:10px; font-weight:700;">ค้นหา</button>
+    </div>
+    <div id="patient-search-results"></div>
+
+    <div class="patient-detail" id="patient-detail">
+      <div class="patient-detail-name" id="patient-detail-name"></div>
+
+      <div class="patient-section-title">ประวัติแพ้ยา</div>
+      <textarea id="patient-allergy-input" rows="2"></textarea>
+      <button class="patient-save-btn" onclick="saveAllergy()">💾 บันทึกประวัติแพ้ยา</button>
+
+      <div class="patient-section-title">ประวัติการซื้อทั้งหมด</div>
+      <div id="patient-purchase-list" style="max-height:160px; overflow-y:auto; margin-bottom:14px;"></div>
+
+      <div class="doc-header-row">
+        <div class="patient-section-title" style="margin-bottom:0;">เอกสารประกอบ</div>
+        <button class="doc-upload-btn" onclick="document.getElementById('patient-upload-input').click()">📷 Upload รูป</button>
+      </div>
+      <input type="file" id="patient-upload-input" accept="image/*" style="display:none;" onchange="onPatientFileSelected(this)">
+      <div class="upload-preview-box" id="upload-preview-box" style="display:none;">
+        <img id="upload-preview-img">
+        <textarea id="patient-upload-note" rows="2" placeholder="หมายเหตุ (ไม่บังคับ)"></textarea>
+        <div class="upload-btn-row">
+          <button class="upload-cancel-btn" onclick="cancelUpload()">ยกเลิก</button>
+          <button class="upload-save-btn" onclick="confirmUpload()">💾 บันทึก</button>
+        </div>
+      </div>
+      <div id="patient-doc-list" style="margin-top:8px;"></div>
+    </div>
+
+    <button class="modal-close-btn" onclick="closePatientDialog()">ปิด</button>
   </div>
 </div>
 
@@ -581,6 +782,160 @@ function pickFavorite(i) {
     .catch(function() { showToast('เชื่อมต่อ server ไม่ได้'); });
 }
 
+// ── Patient profile (ประวัติผู้ป่วย) ─────────────────────────────
+var currentPatientId = null;
+
+function openPatientDialog() {
+  document.getElementById('patient-search-input').value = '';
+  document.getElementById('patient-search-results').innerHTML = '';
+  document.getElementById('patient-detail').style.display = 'none';
+  cancelUpload();
+  currentPatientId = null;
+  document.getElementById('patient-overlay').classList.add('show');
+}
+function closePatientDialog() { document.getElementById('patient-overlay').classList.remove('show'); }
+
+function clearPatientSearch() {
+  document.getElementById('patient-search-input').value = '';
+  document.getElementById('patient-search-results').innerHTML = '';
+}
+
+function searchPatients() {
+  var q = document.getElementById('patient-search-input').value.trim();
+  if (!q) return;
+  fetch('/api/patients?q=' + encodeURIComponent(q))
+    .then(function(r) { return r.json(); })
+    .then(function(list) { renderPatientResults(list || [], q); })
+    .catch(function() { showToast('เชื่อมต่อ server ไม่ได้'); });
+}
+
+function renderPatientResults(list, term) {
+  window._lastPatientResults = list;
+  var el = document.getElementById('patient-search-results');
+  if (!list.length) {
+    el.innerHTML = '<div class="empty-hint">ไม่พบผู้ป่วย - '
+      + '<span style="color:var(--primary); text-decoration:underline; cursor:pointer;" onclick="createPatient()">+ สร้างประวัติใหม่</span></div>';
+    return;
+  }
+  el.innerHTML = list.map(function(p, i) {
+    return '<div class="result-item" onclick="loadPatient(' + p.id + ')">'
+      + '<span class="result-name">' + escHtml(p.name) + (p.phone ? ' - ' + escHtml(p.phone) : '') + '</span>'
+      + '</div>';
+  }).join('');
+}
+
+function createPatient() {
+  var term = document.getElementById('patient-search-input').value.trim();
+  var isPhoneLike = /^[0-9\-\s]+$/.test(term);
+  var body = isPhoneLike ? { name: '', phone: term } : { name: term, phone: '' };
+  fetch('/api/patient_create', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) })
+    .then(function(r) { return r.json(); })
+    .then(function(j) {
+      if (!j.ok) { showToast(j.message || 'สร้างไม่สำเร็จ'); return; }
+      loadPatient(j.id);
+    });
+}
+
+function loadPatient(id) {
+  currentPatientId = id;
+  cancelUpload();
+  fetch('/api/patient?id=' + id)
+    .then(function(r) { return r.json(); })
+    .then(function(j) {
+      if (!j.ok) { showToast(j.message || 'โหลดไม่สำเร็จ'); return; }
+      document.getElementById('patient-detail').style.display = 'block';
+      document.getElementById('patient-detail-name').textContent =
+        j.patient.name + (j.patient.phone ? ' (' + j.patient.phone + ')' : '');
+      document.getElementById('patient-allergy-input').value = j.patient.allergy_note || '';
+      renderPurchaseHistory(j.jobs || []);
+      renderDocuments(j.documents || []);
+    })
+    .catch(function() { showToast('เชื่อมต่อ server ไม่ได้'); });
+}
+
+function renderPurchaseHistory(jobs) {
+  var el = document.getElementById('patient-purchase-list');
+  if (!jobs.length) { el.innerHTML = '<div class="empty-hint">ยังไม่มีประวัติการซื้อ</div>'; return; }
+  el.innerHTML = jobs.map(function(j) {
+    var names = j.drugs.slice(0, 3).map(function(d) { return d.drug1; }).join(', ');
+    if (j.drugs.length > 3) names += ', ...';
+    return '<div class="purchase-item">' + escHtml(j.printed_at.replace('T', ' ').slice(0, 16)) + ' - ' + escHtml(names) + '</div>';
+  }).join('');
+}
+
+function saveAllergy() {
+  if (!currentPatientId) return;
+  var note = document.getElementById('patient-allergy-input').value;
+  fetch('/api/patient_allergy', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ id: currentPatientId, allergy_note: note }),
+  })
+    .then(function(r) { return r.json(); })
+    .then(function(j) { showToast(j.ok ? 'บันทึกประวัติแพ้ยาแล้ว' : (j.message || 'บันทึกไม่สำเร็จ')); });
+}
+
+function renderDocuments(docs) {
+  var el = document.getElementById('patient-doc-list');
+  if (!docs.length) { el.innerHTML = '<div class="empty-hint">ยังไม่มีเอกสาร</div>'; return; }
+  el.innerHTML = docs.map(function(d) {
+    return '<div class="doc-item">'
+      + '<img class="doc-thumb" src="/patient_docs/' + currentPatientId + '/' + d.image_path + '">'
+      + '<div class="doc-note">' + escHtml(d.note || '(ไม่มีหมายเหตุ)') + '</div>'
+      + '<button class="doc-del-btn" onclick="deletePatientDoc(' + d.id + ')">✕</button>'
+      + '</div>';
+  }).join('');
+}
+
+// Selecting a file no longer uploads immediately - shows an inline preview
+// + note field + explicit "บันทึก" button first, so it's obvious where the
+// save step is instead of relying on a blocking native prompt() (which
+// looked like there was no save button at all).
+var pendingUploadFile = null;
+
+function onPatientFileSelected(input) {
+  if (!currentPatientId || !input.files || !input.files.length) return;
+  pendingUploadFile = input.files[0];
+  document.getElementById('patient-upload-note').value = '';
+  var img = document.getElementById('upload-preview-img');
+  img.src = URL.createObjectURL(pendingUploadFile);
+  document.getElementById('upload-preview-box').style.display = 'block';
+  input.value = '';
+}
+
+function cancelUpload() {
+  pendingUploadFile = null;
+  document.getElementById('upload-preview-box').style.display = 'none';
+  document.getElementById('patient-upload-note').value = '';
+}
+
+function confirmUpload() {
+  if (!currentPatientId || !pendingUploadFile) return;
+  var note = document.getElementById('patient-upload-note').value;
+  var formData = new FormData();
+  formData.append('patient_id', currentPatientId);
+  formData.append('note', note);
+  formData.append('image', pendingUploadFile);
+  fetch('/api/patient_upload', { method: 'POST', body: formData })
+    .then(function(r) { return r.json(); })
+    .then(function(j) {
+      if (!j.ok) { showToast(j.message || 'อัปโหลดไม่สำเร็จ'); return; }
+      showToast('อัปโหลดรูปแล้ว');
+      cancelUpload();
+      loadPatient(currentPatientId);
+    })
+    .catch(function() { showToast('เชื่อมต่อ server ไม่ได้'); });
+}
+
+function deletePatientDoc(id) {
+  showConfirm('ลบเอกสารนี้ถาวรใช่ไหม?', function() {
+    fetch('/api/patient_doc_delete', {
+      method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ id: id }),
+    })
+      .then(function(r) { return r.json(); })
+      .then(function() { loadPatient(currentPatientId); });
+  });
+}
+
 // ── Dose text + label preview - mirrors label_gui.py build_label_image() ──
 function buildDoseText(d) {
   var mode = d.usage_mode || 'oral';
@@ -682,6 +1037,7 @@ function submitQueue() {
   btn.disabled = true;
   var body = {
     patient_name: currentStaff,
+    has_allergy: document.getElementById('allergy-checkbox').checked,
     drugs: selected.map(function(d) {
       return {
         idproduct: d.idproduct, drug1: d.drug1, drug2: d.drug2, note: d.note,
@@ -697,6 +1053,7 @@ function submitQueue() {
       btn.disabled = false;
       if (!j.ok) { showToast(j.message || 'ส่งไม่สำเร็จ'); return; }
       selected = [];
+      document.getElementById('allergy-checkbox').checked = false;
       renderSelected();
       showToast('✅ ส่งไปที่คิวพิมพ์ฉลากแล้ว');
     })

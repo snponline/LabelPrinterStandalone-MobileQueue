@@ -49,6 +49,8 @@ def save_favorites(favorites):
         json.dump(favorites, f, ensure_ascii=False, indent=2)
 
 
+APP_VERSION = "1.1.0"
+
 DOTS_PER_MM = 8  # matches standard 203dpi thermal label printers
 
 TIME_OPTIONS = storage.TIME_OPTIONS  # เช้า/เที่ยง/เย็น/ก่อนนอน
@@ -274,6 +276,80 @@ def draw_thai_text(draw, xy, text, font, fill=0):
         i += 1
 
 
+def ask_upload_note(parent):
+    """Bigger note-entry dialog for patient document uploads (replaces
+    simpledialog.askstring, whose fixed small entry/font was hard to use
+    for longer notes). Returns the note string, or None if cancelled."""
+    win = tk.Toplevel(parent)
+    win.title("หมายเหตุ")
+    win.transient(parent)
+    win.grab_set()
+
+    result = {"value": None}
+
+    tk.Label(
+        win, text="ใส่หมายเหตุ (ถ้ามี) แล้วกด OK เพื่ออัปโหลด:",
+        font=("Tahoma", fs(20)), anchor="w",
+    ).pack(fill="x", padx=fs(12), pady=(fs(12), fs(6)))
+
+    text_box = tk.Text(win, font=("Tahoma", fs(20)), width=45, height=9, wrap="word")
+    text_box.pack(fill="both", expand=True, padx=fs(12), pady=(0, fs(10)))
+    text_box.focus_set()
+
+    def on_ok(event=None):
+        result["value"] = text_box.get("1.0", "end-1c").strip()
+        win.destroy()
+
+    def on_cancel(event=None):
+        result["value"] = None
+        win.destroy()
+
+    btn_row = tk.Frame(win)
+    btn_row.pack(fill="x", padx=fs(12), pady=(0, fs(12)))
+    tk.Button(btn_row, text="OK", font=("Tahoma", fs(11)), width=10, command=on_ok).pack(side="right", padx=(fs(6), 0))
+    tk.Button(btn_row, text="Cancel", font=("Tahoma", fs(11)), width=10, command=on_cancel).pack(side="right")
+
+    win.protocol("WM_DELETE_WINDOW", on_cancel)
+    win.bind("<Escape>", on_cancel)
+    win.update_idletasks()
+    win.minsize(win.winfo_width(), win.winfo_height())
+    win.wait_window()
+    return result["value"]
+
+
+def compute_dose_lines(data):
+    """Returns (dose_text, line2) - the same wording used on the physical
+    label. Shared between build_label_image() (rendering) and the print
+    history dialog (showing dosing info on click) so the two can never
+    drift apart."""
+    usage_mode = data.get("usage_mode", "oral")
+    if usage_mode == "topical":
+        # ยาทา: no unit/meal - "ทาบางๆ วันละ N ครั้ง" then times/every_hr only
+        dose_text = f"ทาบางๆ วันละ {data.get('per_day') or '__'} ครั้ง"
+        line2 = "  ".join(data.get("times") or [])
+        if data.get("every_hr"):
+            line2 += f"   ทุก {data['every_hr']} ชม."
+    elif usage_mode == "drops":
+        # ยาหยอด: unit fixed to หยด, no meal - "หยอดครั้งละ N หยด วันละ M ครั้ง"
+        dose_text = f"หยอดครั้งละ {data.get('qty') or '__'} หยด"
+        if data.get("per_day"):
+            dose_text += f"   วันละ {data['per_day']} ครั้ง"
+        line2 = "  ".join(data.get("times") or [])
+        if data.get("every_hr"):
+            line2 += f"   ทุก {data['every_hr']} ชม."
+    else:
+        unit = data.get("unit") or "เม็ด"
+        dose_text = f"ทานครั้งละ {data.get('qty') or '__'} {unit}"
+        if data.get("per_day"):
+            dose_text += f"   วันละ {data['per_day']} ครั้ง"
+        line2 = data.get("meal") or ""
+        if data.get("times"):
+            line2 += ("    " if line2 else "") + "  ".join(data["times"])
+        if data.get("every_hr"):
+            line2 += f"   ทุก {data['every_hr']} ชม."
+    return dose_text, line2
+
+
 def build_label_image(data, settings):
     label_w_px = int(settings["label_w_mm"]) * DOTS_PER_MM
     label_h_px = int(settings["label_h_mm"]) * DOTS_PER_MM
@@ -345,31 +421,7 @@ def build_label_image(data, settings):
         draw_thai_text(draw, (x, y), data["note"], note_font, fill=0)
         y += 28
 
-    usage_mode = data.get("usage_mode", "oral")
-    if usage_mode == "topical":
-        # ยาทา: no unit/meal - "ทาบางๆ วันละ N ครั้ง" then times/every_hr only
-        dose_text = f"ทาบางๆ วันละ {data['per_day'] or '__'} ครั้ง"
-        line2 = "  ".join(data["times"])
-        if data["every_hr"]:
-            line2 += f"   ทุก {data['every_hr']} ชม."
-    elif usage_mode == "drops":
-        # ยาหยอด: unit fixed to หยด, no meal - "หยอดครั้งละ N หยด วันละ M ครั้ง"
-        dose_text = f"หยอดครั้งละ {data['qty'] or '__'} หยด"
-        if data["per_day"]:
-            dose_text += f"   วันละ {data['per_day']} ครั้ง"
-        line2 = "  ".join(data["times"])
-        if data["every_hr"]:
-            line2 += f"   ทุก {data['every_hr']} ชม."
-    else:
-        unit = data.get("unit") or "เม็ด"
-        dose_text = f"ทานครั้งละ {data['qty'] or '__'} {unit}"
-        if data["per_day"]:
-            dose_text += f"   วันละ {data['per_day']} ครั้ง"
-        line2 = data["meal"] or ""
-        if data["times"]:
-            line2 += "    " + "  ".join(data["times"])
-        if data["every_hr"]:
-            line2 += f"   ทุก {data['every_hr']} ชม."
+    dose_text, line2 = compute_dose_lines(data)
 
     dose_font = fit_font(draw, dose_text, label_w_px - 2 * x, 26, bold=True)
     draw_thai_text(draw, (x, y), dose_text, dose_font, fill=0)
@@ -388,17 +440,28 @@ def build_label_image(data, settings):
 
     draw.line([(x, y), (label_w_px - x, y)], fill=0, width=1)
     y += 16
-    draw_thai_text(draw, (x, y), "แพ้ยา มีโรคประจำตัว ตั้งครรภ์ ให้นมบุตร โปรดแจ้งเภสัชกร", f_medium, fill=0)
+    warning_text = "แพ้ยา มีโรคประจำตัว ตั้งครรภ์ ให้นมบุตร โปรดแจ้งเภสัชกร"
+    draw_thai_text(draw, (x, y), warning_text, f_medium, fill=0)
 
-    # pharmacist name, right-aligned on the SAME row as the warning line
-    # above (not a separate row below it) - address now sits under the
-    # company header at the top instead of down here
+    # allergy status - flush right on the same line, underlined so it stands
+    # out from the generic warning text next to it
+    status_text = "แพ้ยา:ดูแฟ้ม" if data.get("has_allergy") else "ไม่แพ้ยา"
+    status_w = draw.textlength(status_text, font=f_medium)
+    status_x = label_w_px - x - status_w
+    draw_thai_text(draw, (status_x, y), status_text, f_medium, fill=0)
+    underline_y = y + 18
+    draw.line([(status_x, underline_y), (status_x + status_w, underline_y)], fill=0, width=1)
+    y += 22
+
+    # pharmacist name on its own row below the warning line, starting at the
+    # same x as "ให้นมบุตร" on the line above - needs the extra width for
+    # pharmacists who want full name + surname + license number
     pharmacist_names = settings.get("pharmacist_names") or ""
     pharm_text = f"เภสัชกร: {pharmacist_names}" if pharmacist_names else ""
     if pharm_text:
         pharm_font = find_font(18)  # 15 * 1.2
-        pharm_w = draw.textlength(pharm_text, font=pharm_font)
-        draw_thai_text(draw, (label_w_px - x - pharm_w, y), pharm_text, pharm_font, fill=0)
+        prefix_w = draw.textlength(warning_text.split("ให้นมบุตร")[0], font=f_medium)
+        draw_thai_text(draw, (x + prefix_w, y), pharm_text, pharm_font, fill=0)
 
     return img
 
@@ -594,7 +657,7 @@ def build_settings_dialog(parent, first_run=False):
 class LabelApp:
     def __init__(self, root):
         self.root = root
-        root.title("พิมพ์ฉลากยา")
+        root.title(f"พิมพ์ฉลากยา v{APP_VERSION}")
         root.geometry(f"{fs(1050)}x{fs(700)}")
         # ttk.Combobox's dropdown popup is a separate internal Listbox that
         # doesn't inherit the widget's own font= option - has to be set via
@@ -645,6 +708,14 @@ class LabelApp:
             search_header, text="📱 คิวจากมือถือ", font=("Tahoma", fs(9), "bold"),
             bg="#5a5a9a", fg="white", command=self.open_queue_dialog,
         ).pack(side="right", padx=(0, fs(6)))
+        tk.Button(
+            search_header, text="📜 แฟ้มประวัติการจ่ายยา", font=("Tahoma", fs(9)),
+            command=self.open_print_history_dialog,
+        ).pack(side="right", padx=(0, fs(6)))
+        tk.Button(
+            search_header, text="🗂 ประวัติผู้ป่วย", font=("Tahoma", fs(9)),
+            command=self.open_patient_profile_dialog,
+        ).pack(side="right", padx=(0, fs(6)))
 
         search_row = tk.Frame(left_frame)
         search_row.pack(fill="x", **pad)
@@ -685,6 +756,10 @@ class LabelApp:
         tk.Button(
             list_header, text="🗑 ล้างทั้งหมด", font=("Tahoma", fs(9)),
             command=self.clear_all_drugs,
+        ).pack(side="right", anchor="n", padx=(fs(6), 0))
+        self.allergy_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            list_header, text="⚠ แพ้ยา", variable=self.allergy_var, font=("Tahoma", fs(9), "bold"), fg="#b03a2e",
         ).pack(side="right", anchor="n", padx=(fs(6), 0))
 
         list_container = tk.Frame(left_frame)
@@ -1070,6 +1145,7 @@ class LabelApp:
         d = self.selected_drugs[index]
         data = dict(d)
         data["patient_name"] = "(ชื่อผู้ป่วย)"
+        data["has_allergy"] = self.allergy_var.get()
         settings = app_settings.load_settings()
         img = build_label_image(data, settings)
 
@@ -1856,6 +1932,8 @@ class LabelApp:
             self.refresh_selected_list()
             if claimed["patient_name"]:
                 self._queue_patient_name = claimed["patient_name"]
+            if claimed.get("has_allergy"):
+                self.allergy_var.set(True)
             win.destroy()
             self.status_var.set(f"ดึงคิวมาแล้ว ({len(resolved)} รายการยา) - กด ยืนยันรายการยา เพื่อพิมพ์")
 
@@ -1865,6 +1943,415 @@ class LabelApp:
         win.lift()
         win.focus_force()
         refresh()
+
+    # ---------------------------------------------------------------- print history
+
+    def open_print_history_dialog(self):
+        win = tk.Toplevel(self.root)
+        win.title("แฟ้มประวัติการจ่ายยา")
+        win.geometry(f"{fs(480)}x{fs(600)}")
+        win.transient(self.root)
+        win.grab_set()
+
+        tk.Label(
+            win, text="เก็บถาวรทุกรายการ (ไม่ลบทิ้งอัตโนมัติ) - ค้นหาชื่อ/เบอร์โทรเพื่อดูประวัติย้อนหลังทั้งหมด "
+                       "ดับเบิลคลิกที่ยาแต่ละตัวเพื่อดูวิธีกิน หรือกด \"ใช้ซ้ำ\" เพื่อโหลดกลับมาพิมพ์ใหม่",
+            font=("Tahoma", fs(9)), fg="#555", wraplength=fs(440), justify="left",
+        ).pack(anchor="w", padx=fs(10), pady=(fs(10), fs(6)))
+
+        tk.Label(
+            win, text="ค้นหาชื่อ/เบอร์โทร (ว่างไว้ = แสดง 24 ชม.ล่าสุด)", font=("Tahoma", fs(9)), fg="#555",
+        ).pack(anchor="w", padx=fs(10))
+        search_row = tk.Frame(win)
+        search_row.pack(fill="x", padx=fs(10), pady=(0, fs(6)))
+        search_var = tk.StringVar()
+        tk.Entry(search_row, textvariable=search_var, font=("Tahoma", fs(10))).pack(side="left", fill="x", expand=True)
+        tk.Button(
+            search_row, text="✕", font=("Tahoma", fs(9), "bold"), fg="white", bg="#555555", width=2,
+            command=lambda: search_var.set(""),
+        ).pack(side="left", padx=(fs(4), 0))
+
+        tk.Label(win, text="รายการ (ชื่อลูกค้า - เบอร์โทร - เวลา - จำนวนยา)", font=("Tahoma", fs(10), "bold")).pack(anchor="w", padx=fs(10))
+        # exportselection=False on BOTH listboxes - without this, Tkinter
+        # treats all listboxes in the app as sharing one "selection", so
+        # selecting a row in drug_list silently clears job_list's selection,
+        # which fires job_list's <<ListboxSelect>> again and wipes drug_list
+        # right back out from under the click (looked like items vanishing
+        # and double-click never registering - this was a real bug, not a
+        # user-error report).
+        job_list = tk.Listbox(win, font=("Tahoma", fs(9)), height=8, exportselection=False)
+        job_list.pack(fill="x", padx=fs(10), pady=(fs(2), fs(4)))
+
+        job_btn_row = tk.Frame(win)
+        job_btn_row.pack(fill="x", padx=fs(10), pady=(0, fs(8)))
+        tk.Button(
+            job_btn_row, text="👁 ซ่อน/แสดง (อ่านแล้ว)", font=("Tahoma", fs(8)),
+            command=lambda: toggle_hidden(),
+        ).pack(side="left")
+        tk.Button(
+            job_btn_row, text="✕ ลบถาวร", font=("Tahoma", fs(8), "bold"), fg="white", bg="#b03a2e",
+            command=lambda: delete_job(),
+        ).pack(side="left", padx=(fs(6), 0))
+
+        tk.Label(win, text="ยาในรายการนี้ (ดับเบิลคลิกดูวิธีกิน)", font=("Tahoma", fs(10), "bold")).pack(anchor="w", padx=fs(10))
+        drug_list = tk.Listbox(win, font=("Tahoma", fs(9)), exportselection=False)
+        drug_list.pack(fill="both", expand=True, padx=fs(10), pady=(fs(2), fs(6)))
+
+        jobs = []
+
+        def format_when(printed_at):
+            try:
+                dt = datetime.fromisoformat(printed_at)
+                return dt.strftime("%d/%m/%Y %H:%M")
+            except Exception:
+                return printed_at
+
+        def refresh():
+            term = search_var.get().strip()
+            try:
+                if term:
+                    jobs_raw = storage.search_print_jobs(term)
+                else:
+                    jobs_raw = storage.list_print_jobs(hours=24)
+            except Exception as e:
+                messagebox.showerror("โหลดไม่สำเร็จ", str(e), parent=win)
+                return
+            jobs.clear()
+            jobs.extend(jobs_raw)
+            job_list.delete(0, tk.END)
+            for idx, job in enumerate(jobs):
+                when = format_when(job["printed_at"])
+                who = job["patient_name"] or "(ไม่ระบุชื่อ)"
+                phone = f" - {job['customer_phone']}" if job.get("customer_phone") else ""
+                job_list.insert(tk.END, f"{who}{phone} - {when} - {len(job['drugs'])} รายการ")
+                if job["hidden"]:
+                    job_list.itemconfig(idx, fg="#aaaaaa")
+            drug_list.delete(0, tk.END)
+
+        def on_job_select(event=None):
+            sel = job_list.curselection()
+            drug_list.delete(0, tk.END)
+            if not sel:
+                return
+            job = jobs[sel[0]]
+            for d in job["drugs"]:
+                label = f"{d['drug1']} ({d['drug2']})" if d.get("drug2") else d["drug1"]
+                drug_list.insert(tk.END, f"{label}  x{d.get('print_qty', 1)}")
+
+        def on_drug_pick(event=None):
+            job_sel = job_list.curselection()
+            drug_sel = drug_list.curselection()
+            if not job_sel or not drug_sel:
+                return
+            job = jobs[job_sel[0]]
+            d = job["drugs"][drug_sel[0]]
+            dose_text, line2 = compute_dose_lines(d)
+            lines = []
+            if d.get("note"):
+                lines.append(d["note"])
+            lines.append(dose_text)
+            if line2:
+                lines.append(line2)
+            if d.get("extra_labels"):
+                lines.append(" ".join(f"**{e}**" for e in d["extra_labels"]))
+            show_dose_popup(d["drug1"], "\n".join(lines))
+
+        def show_dose_popup(title, text):
+            # messagebox.showinfo can't have a custom font - use a plain
+            # Toplevel instead so the dosing text can be shown 2x normal
+            # size (easier to read at a glance while counting out pills).
+            popup = tk.Toplevel(win)
+            popup.title(title)
+            popup.transient(win)
+            popup.grab_set()
+            tk.Label(
+                popup, text=title, font=("Tahoma", fs(14), "bold"), wraplength=fs(380), justify="left",
+            ).pack(padx=fs(20), pady=(fs(16), fs(4)))
+            tk.Label(
+                popup, text=text, font=("Tahoma", fs(20)), wraplength=fs(380), justify="left",
+            ).pack(padx=fs(20), pady=(fs(4), fs(16)))
+            tk.Button(popup, text="ปิด", font=("Tahoma", fs(11)), command=popup.destroy).pack(pady=(0, fs(14)))
+            popup.lift()
+            popup.focus_force()
+
+        def reuse_job():
+            sel = job_list.curselection()
+            if not sel:
+                messagebox.showwarning("แจ้งเตือน", "กรุณาเลือกรายการก่อน", parent=win)
+                return
+            job = jobs[sel[0]]
+            # never fully trust the snapshot from when it was printed -
+            # re-check against the current local templates, same principle
+            # as loading a Favorite or claiming a mobile-queue job
+            for d in job["drugs"]:
+                entry = dict(d)
+                idproduct = entry.get("idproduct")
+                info = storage.get_template(idproduct) if idproduct else None
+                if has_dosing_data(info):
+                    entry.update(info)
+                    entry["status"] = "db"
+                else:
+                    entry.setdefault("status", "missing")
+                self.selected_drugs.append(entry)
+            self.refresh_selected_list()
+            win.destroy()
+            self.status_var.set(f"โหลดรายการซ้ำแล้ว ({len(job['drugs'])} รายการยา)")
+
+        def toggle_hidden():
+            sel = job_list.curselection()
+            if not sel:
+                messagebox.showwarning("แจ้งเตือน", "กรุณาเลือกรายการก่อน", parent=win)
+                return
+            job = jobs[sel[0]]
+            storage.set_print_job_hidden(job["id"], not job["hidden"])
+            refresh()
+
+        def delete_job():
+            sel = job_list.curselection()
+            if not sel:
+                messagebox.showwarning("แจ้งเตือน", "กรุณาเลือกรายการก่อน", parent=win)
+                return
+            job = jobs[sel[0]]
+            who = job["patient_name"] or "(ไม่ระบุชื่อ)"
+            if not messagebox.askyesno("ยืนยัน", f"ลบรายการของ '{who}' ถาวรใช่ไหม? กู้คืนไม่ได้", parent=win):
+                return
+            storage.delete_print_job(job["id"])
+            refresh()
+
+        job_list.bind("<<ListboxSelect>>", on_job_select)
+        drug_list.bind("<Double-Button-1>", on_drug_pick)
+        search_var.trace_add("write", lambda *a: refresh())
+
+        btn_row = tk.Frame(win)
+        btn_row.pack(pady=(0, fs(8)))
+        tk.Button(
+            btn_row, text="🔁 ใช้ซ้ำ (โหลดกลับมาพิมพ์)", font=("Tahoma", fs(9), "bold"),
+            bg="#1a7a4a", fg="white", command=reuse_job,
+        ).pack(side="left", padx=fs(4))
+        tk.Button(btn_row, text="🔄 รีเฟรช", font=("Tahoma", fs(9)), command=refresh).pack(side="left", padx=fs(4))
+
+        win.lift()
+        win.focus_force()
+        refresh()
+
+    # ---------------------------------------------------------------- patient profile
+
+    def open_patient_profile_dialog(self):
+        win = tk.Toplevel(self.root)
+        win.title("ประวัติผู้ป่วย")
+        win_w = fs(520)
+        win_h = min(fs(660), win.winfo_screenheight() - fs(80))
+        win_x = (win.winfo_screenwidth() - win_w) // 2
+        win_y = max(0, (win.winfo_screenheight() - win_h) // 2 - fs(20))
+        win.geometry(f"{win_w}x{win_h}+{win_x}+{win_y}")
+        win.transient(self.root)
+        win.grab_set()
+
+        tk.Label(win, text="ค้นหาชื่อ/เบอร์โทร", font=("Tahoma", fs(10), "bold")).pack(anchor="w", padx=fs(10), pady=(fs(10), fs(2)))
+        search_row = tk.Frame(win)
+        search_row.pack(fill="x", padx=fs(10), pady=(0, fs(6)))
+        search_var = tk.StringVar()
+        search_entry = tk.Entry(search_row, textvariable=search_var, font=("Tahoma", fs(10)))
+        search_entry.pack(side="left", fill="x", expand=True)
+        tk.Button(
+            search_row, text="✕", font=("Tahoma", fs(9), "bold"), fg="white", bg="#555555", width=2,
+            command=lambda: (search_var.set(""), result_list.delete(0, tk.END)),
+        ).pack(side="left", padx=(fs(4), 0))
+        tk.Button(search_row, text="ค้นหา", font=("Tahoma", fs(9)), command=lambda: do_search()).pack(side="left", padx=(fs(4), 0))
+
+        result_list = tk.Listbox(win, font=("Tahoma", fs(9)), height=4, exportselection=False)
+        result_list.pack(fill="x", padx=fs(10), pady=(0, fs(8)))
+
+        divider = tk.Frame(win, height=2, bg="#ccc")
+        divider.pack(fill="x", padx=fs(10), pady=(0, fs(6)))
+
+        patient_name_var = tk.StringVar(value="(ยังไม่ได้เลือกผู้ป่วย)")
+        tk.Label(win, textvariable=patient_name_var, font=("Tahoma", fs(13), "bold"), fg="#1a7a4a").pack(
+            anchor="w", padx=fs(10), pady=(0, fs(4))
+        )
+
+        tk.Label(win, text="ประวัติแพ้ยา", font=("Tahoma", fs(10), "bold")).pack(anchor="w", padx=fs(10))
+        allergy_text = tk.Text(win, font=("Tahoma", fs(10)), height=3, bd=1, relief="solid")
+        allergy_text.pack(fill="x", padx=fs(10), pady=(fs(2), fs(4)))
+        tk.Button(
+            win, text="💾 บันทึกประวัติแพ้ยา", font=("Tahoma", fs(9), "bold"), bg="#1a7a4a", fg="white",
+            command=lambda: save_allergy(),
+        ).pack(anchor="w", padx=fs(10), pady=(0, fs(8)))
+
+        tk.Label(win, text="ประวัติการซื้อทั้งหมด", font=("Tahoma", fs(10), "bold")).pack(anchor="w", padx=fs(10))
+        purchase_list = tk.Listbox(win, font=("Tahoma", fs(9)), height=4, exportselection=False)
+        purchase_list.pack(fill="x", padx=fs(10), pady=(fs(2), fs(8)))
+
+        doc_header_row = tk.Frame(win)
+        doc_header_row.pack(fill="x", padx=fs(10))
+        tk.Label(doc_header_row, text="เอกสารประกอบ (รูป+หมายเหตุ)", font=("Tahoma", fs(10), "bold")).pack(side="left")
+        tk.Button(
+            doc_header_row, text="📷 เพิ่มรูป+หมายเหตุ", font=("Tahoma", fs(8), "bold"), bg="#1a5a9a", fg="white",
+            command=lambda: upload_doc(),
+        ).pack(side="right")
+
+        doc_list_outer = tk.Frame(win, bd=1, relief="solid")
+        doc_list_outer.pack(fill="both", expand=True, padx=fs(10), pady=(fs(2), fs(8)))
+        doc_canvas = tk.Canvas(doc_list_outer, highlightthickness=0)
+        doc_scroll = tk.Scrollbar(doc_list_outer, orient="vertical", command=doc_canvas.yview)
+        doc_rows_frame = tk.Frame(doc_canvas)
+        doc_rows_frame.bind(
+            "<Configure>", lambda e: doc_canvas.configure(scrollregion=doc_canvas.bbox("all"))
+        )
+        doc_canvas_window = doc_canvas.create_window((0, 0), window=doc_rows_frame, anchor="nw")
+        doc_canvas.bind(
+            "<Configure>", lambda e: doc_canvas.itemconfig(doc_canvas_window, width=e.width)
+        )
+        doc_canvas.configure(yscrollcommand=doc_scroll.set)
+        doc_canvas.pack(side="left", fill="both", expand=True)
+        doc_scroll.pack(side="right", fill="y")
+
+        current_patient = {"id": None, "name": "", "phone": ""}
+        results = []
+        purchase_jobs = []
+        docs = []
+
+        def format_when(iso_str):
+            try:
+                return datetime.fromisoformat(iso_str).strftime("%d/%m/%Y %H:%M")
+            except Exception:
+                return iso_str
+
+        def load_patient(patient_id):
+            p = storage.get_patient(patient_id)
+            if not p:
+                return
+            current_patient["id"] = p["id"]
+            current_patient["name"] = p["name"]
+            current_patient["phone"] = p["phone"]
+            patient_name_var.set(p["name"] + (f" ({p['phone']})" if p["phone"] else ""))
+            allergy_text.delete("1.0", "end")
+            allergy_text.insert("1.0", p["allergy_note"])
+            refresh_purchase_history()
+            refresh_documents()
+
+        def do_search():
+            term = search_var.get().strip()
+            if not term:
+                return
+            results.clear()
+            results.extend(storage.search_patients(term))
+            result_list.delete(0, tk.END)
+            for p in results:
+                phone_part = f" - {p['phone']}" if p["phone"] else ""
+                result_list.insert(tk.END, f"{p['name']}{phone_part}")
+            if not results:
+                if messagebox.askyesno(
+                    "ไม่พบผู้ป่วย", f"ไม่พบผู้ป่วยชื่อ/เบอร์ '{term}' ต้องการสร้างประวัติใหม่ไหม?", parent=win,
+                ):
+                    # crude heuristic: all-digit-ish term -> phone, else name
+                    if term.replace("-", "").replace(" ", "").isdigit():
+                        pid = storage.find_or_create_patient("", term)
+                    else:
+                        pid = storage.find_or_create_patient(term, "")
+                    load_patient(pid)
+
+        def on_result_select(event=None):
+            sel = result_list.curselection()
+            if not sel:
+                return
+            load_patient(results[sel[0]]["id"])
+
+        def refresh_purchase_history():
+            purchase_list.delete(0, tk.END)
+            purchase_jobs.clear()
+            if not current_patient["id"]:
+                return
+            jobs = storage.list_print_jobs_for_patient(current_patient["name"], current_patient["phone"])
+            purchase_jobs.extend(jobs)
+            if not jobs:
+                purchase_list.insert(tk.END, "(ยังไม่มีประวัติการซื้อ)")
+                return
+            for job in jobs:
+                when = format_when(job["printed_at"])
+                drug_names = ", ".join(d["drug1"] for d in job["drugs"][:3])
+                if len(job["drugs"]) > 3:
+                    drug_names += ", ..."
+                purchase_list.insert(tk.END, f"{when} - {drug_names}")
+
+        def save_allergy():
+            if not current_patient["id"]:
+                messagebox.showwarning("แจ้งเตือน", "กรุณาค้นหา/เลือกผู้ป่วยก่อน", parent=win)
+                return
+            note = allergy_text.get("1.0", "end").strip()
+            storage.update_patient_allergy(current_patient["id"], note)
+            self.status_var.set(f"บันทึกประวัติแพ้ยาของ {current_patient['name']} แล้ว")
+
+        def refresh_documents():
+            for child in doc_rows_frame.winfo_children():
+                child.destroy()
+            docs.clear()
+            if not current_patient["id"]:
+                return
+            docs.extend(storage.list_patient_documents(current_patient["id"]))
+            if not docs:
+                tk.Label(doc_rows_frame, text="(ยังไม่มีเอกสาร)", font=("Tahoma", fs(9))).pack(
+                    anchor="w", padx=fs(4), pady=fs(4)
+                )
+                return
+            for d in docs:
+                when = format_when(d["uploaded_at"])
+                note_part = f" - {d['note']}" if d["note"] else ""
+                row = tk.Frame(doc_rows_frame)
+                row.pack(fill="x", padx=fs(4), pady=fs(2))
+                tk.Label(
+                    row, text=f"{when}{note_part}", font=("Tahoma", fs(9)),
+                    anchor="w", justify="left", wraplength=fs(320),
+                ).pack(side="left", fill="x", expand=True)
+                tk.Button(
+                    row, text="✕", font=("Tahoma", fs(7), "bold"), fg="white", bg="#b03a2e", width=2,
+                    command=lambda d=d: delete_doc(d),
+                ).pack(side="right", padx=(fs(3), 0))
+                tk.Button(
+                    row, text="👁", font=("Tahoma", fs(7)), width=2,
+                    command=lambda d=d: view_doc(d),
+                ).pack(side="right", padx=(fs(2), 0))
+
+        def upload_doc():
+            if not current_patient["id"]:
+                messagebox.showwarning("แจ้งเตือน", "กรุณาค้นหา/เลือกผู้ป่วยก่อน", parent=win)
+                return
+            path = filedialog.askopenfilename(
+                title="เลือกรูปภาพ", parent=win,
+                filetypes=[("Image files", "*.jpg *.jpeg *.png *.bmp *.gif")],
+            )
+            if not path:
+                return
+            note = ask_upload_note(win)
+            if note is None:
+                return
+            try:
+                with open(path, "rb") as f:
+                    image_bytes = f.read()
+                storage.add_patient_document(current_patient["id"], image_bytes, note)
+            except Exception as e:
+                messagebox.showerror("อัปโหลดไม่สำเร็จ", str(e), parent=win)
+                return
+            refresh_documents()
+
+        def view_doc(d):
+            try:
+                os.startfile(d["full_path"])
+            except Exception as e:
+                messagebox.showerror("เปิดไม่สำเร็จ", str(e), parent=win)
+
+        def delete_doc(d):
+            if not messagebox.askyesno("ยืนยัน", "ลบเอกสารนี้ถาวรใช่ไหม?", parent=win):
+                return
+            storage.delete_patient_document(d["id"])
+            refresh_documents()
+
+        result_list.bind("<<ListboxSelect>>", on_result_select)
+        search_entry.bind("<Return>", lambda e: do_search())
+
+        win.lift()
+        win.focus_force()
+        search_entry.focus_set()
 
     # ---------------------------------------------------------------- confirm + print
 
@@ -1879,13 +2366,13 @@ class LabelApp:
 
         win = tk.Toplevel(self.root)
         win.title("ชื่อผู้ป่วย")
-        win.geometry(f"{fs(360)}x{fs(210)}")
+        win.geometry(f"{fs(360)}x{fs(280)}")
         win.transient(self.root)
         win.grab_set()
 
         tk.Label(win, text=f"พร้อมพิมพ์ {total_labels} ฉลาก ({len(self.selected_drugs)} รายการยา)",
                  font=("Tahoma", fs(10))).pack(pady=(fs(14), fs(4)))
-        tk.Label(win, text="ชื่อผู้ป่วย *", font=("Tahoma", fs(10), "bold")).pack(anchor="w", padx=fs(14))
+        tk.Label(win, text="ชื่อ นามสกุล (ไม่บังคับ)", font=("Tahoma", fs(10), "bold")).pack(anchor="w", padx=fs(14))
         patient_var = tk.StringVar(value=self._queue_patient_name or "")
         self._queue_patient_name = None  # one-shot - don't leak into the next unrelated print
         entry = tk.Entry(win, textvariable=patient_var, font=("Tahoma", fs(12)))
@@ -1906,27 +2393,35 @@ class LabelApp:
             command=on_anon_toggle,
         ).pack(anchor="w", padx=fs(14))
 
+        tk.Label(win, text="เบอร์โทร (ไม่บังคับ)", font=("Tahoma", fs(10), "bold")).pack(anchor="w", padx=fs(14), pady=(fs(6), 0))
+        phone_var = tk.StringVar(value="")
+        tk.Entry(win, textvariable=phone_var, font=("Tahoma", fs(12))).pack(fill="x", padx=fs(14), pady=fs(4))
+
         status_var = tk.StringVar(value="")
         tk.Label(win, textvariable=status_var, font=("Tahoma", fs(9)), fg="#070", wraplength=fs(320)).pack(pady=(fs(4), 0))
 
         def do_print():
+            # both name and phone are optional now - printing an unnamed
+            # label is a valid choice, not an error the user has to work
+            # around by ticking "anonymous" every single time
             name = "ไม่ประสงค์ออกนาม" if anon_var.get() else patient_var.get().strip()
-            if not name:
-                messagebox.showwarning("แจ้งเตือน", "กรุณาใส่ชื่อผู้ป่วย หรือติ๊กไม่ประสงค์ออกนาม", parent=win)
-                return
+            phone = phone_var.get().strip()
             print_btn.config(state="disabled")
             status_var.set("กำลังพิมพ์...")
 
             def worker():
                 try:
                     settings = app_settings.load_settings()
+                    has_allergy = self.allergy_var.get()
                     for d in self.selected_drugs:
                         data = dict(d)
                         data["patient_name"] = name
+                        data["has_allergy"] = has_allergy
                         img = build_label_image(data, settings)
                         img.save(DEBUG_PREVIEW_PATH)
                         for _ in range(d.get("print_qty", 1)):
                             print_image(img)
+                    storage.add_print_job(name, phone, self.selected_drugs)
                     self.root.after(0, lambda: self.on_print_done(win, total_labels))
                 except Exception as e:
                     self.root.after(0, lambda: status_var.set(f"เกิดข้อผิดพลาด: {e}"))
@@ -1947,6 +2442,7 @@ class LabelApp:
         win.destroy()
         self.status_var.set(f"พิมพ์ครบ {total_labels} ฉลากแล้ว")
         self.selected_drugs = []
+        self.allergy_var.set(False)
         self.refresh_selected_list()
 
 
