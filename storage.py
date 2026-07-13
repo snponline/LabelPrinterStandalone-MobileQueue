@@ -66,6 +66,14 @@ def _connect():
         conn.execute("ALTER TABLE print_jobs ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0")
     if "customer_phone" not in existing_job_cols:
         conn.execute("ALTER TABLE print_jobs ADD COLUMN customer_phone TEXT")
+    # archived is deliberately separate from hidden: hidden is the per-row
+    # "mark as read" toggle (dims the row gray, stays in the list); archived
+    # is the bulk "start a new day" action (removed from the default view
+    # entirely, toggle-able back). Conflating the two made the per-row toggle
+    # make rows vanish instead of just dimming - this column exists so both
+    # can coexist without interfering with each other.
+    if "archived" not in existing_job_cols:
+        conn.execute("ALTER TABLE print_jobs ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
     # indexes for search-by-patient to stay fast even after years of history
     conn.execute("CREATE INDEX IF NOT EXISTS idx_print_jobs_patient ON print_jobs(patient_name)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_print_jobs_phone ON print_jobs(customer_phone)")
@@ -443,7 +451,7 @@ def add_print_job(patient_name, customer_phone, drugs):
 
 def _rows_to_jobs(conn, job_rows):
     jobs = []
-    for job_id, patient_name, customer_phone, printed_at, hidden in job_rows:
+    for job_id, patient_name, customer_phone, printed_at, hidden, archived in job_rows:
         item_rows = conn.execute(
             """
             SELECT idproduct, drug1, drug2, note, qty, unit, per_day, every_hr, meal,
@@ -465,7 +473,7 @@ def _rows_to_jobs(conn, job_rows):
             })
         jobs.append({
             "id": job_id, "patient_name": patient_name or "", "customer_phone": customer_phone or "",
-            "printed_at": printed_at, "hidden": bool(hidden), "drugs": drugs,
+            "printed_at": printed_at, "hidden": bool(hidden), "archived": bool(archived), "drugs": drugs,
         })
     return jobs
 
@@ -479,12 +487,12 @@ def list_print_jobs(hours=24):
     try:
         if hours is None:
             job_rows = conn.execute(
-                "SELECT id, patient_name, customer_phone, printed_at, hidden FROM print_jobs ORDER BY printed_at DESC"
+                "SELECT id, patient_name, customer_phone, printed_at, hidden, archived FROM print_jobs ORDER BY printed_at DESC"
             ).fetchall()
         else:
             cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
             job_rows = conn.execute(
-                "SELECT id, patient_name, customer_phone, printed_at, hidden FROM print_jobs "
+                "SELECT id, patient_name, customer_phone, printed_at, hidden, archived FROM print_jobs "
                 "WHERE printed_at >= ? ORDER BY printed_at DESC",
                 (cutoff,),
             ).fetchall()
@@ -502,7 +510,7 @@ def search_print_jobs(term, limit=200):
         like = f"%{term}%"
         job_rows = conn.execute(
             """
-            SELECT id, patient_name, customer_phone, printed_at, hidden FROM print_jobs
+            SELECT id, patient_name, customer_phone, printed_at, hidden, archived FROM print_jobs
             WHERE patient_name LIKE ? OR customer_phone LIKE ?
             ORDER BY printed_at DESC LIMIT ?
             """,
@@ -531,7 +539,7 @@ def list_print_jobs_for_patient(name, phone, limit=500):
             return []
         where = " OR ".join(conditions)
         job_rows = conn.execute(
-            f"SELECT id, patient_name, customer_phone, printed_at, hidden FROM print_jobs "
+            f"SELECT id, patient_name, customer_phone, printed_at, hidden, archived FROM print_jobs "
             f"WHERE {where} ORDER BY printed_at DESC LIMIT ?",
             (*params, limit),
         ).fetchall()
@@ -558,6 +566,22 @@ def delete_print_job(job_id):
     try:
         conn.execute("DELETE FROM print_job_items WHERE job_id = ?", (job_id,))
         conn.execute("DELETE FROM print_jobs WHERE id = ?", (job_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def set_all_print_jobs_archived(archived):
+    """Bulk archive/un-archive every job - deliberately a SEPARATE flag from
+    `hidden` (the per-row "mark as read" toggle, which only dims a row gray
+    and must never make it vanish from the list). Archiving clears the
+    default 24-hour view for a new day; un-archiving is the toggle-back in
+    case that was clicked by mistake or the day's entries need a second
+    look. Does NOT delete anything - full history stays permanently
+    searchable via search_print_jobs() regardless of archived state."""
+    conn = _connect()
+    try:
+        conn.execute("UPDATE print_jobs SET archived = ?", (1 if archived else 0,))
         conn.commit()
     finally:
         conn.close()
@@ -629,6 +653,23 @@ def find_or_create_patient(name, phone):
         )
         conn.commit()
         return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def find_patients_by_exact_name(name):
+    """Existing records with this exact name (any phone) - used at print time
+    to warn the pharmacist when saving to a patient file would be ambiguous
+    (two different people can share a name; phone is what tells them apart)."""
+    name = (name or "").strip()
+    if not name:
+        return []
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT id, IFNULL(phone, '') FROM patients WHERE name = ?", (name,)
+        ).fetchall()
+        return [{"id": r[0], "phone": r[1]} for r in rows]
     finally:
         conn.close()
 

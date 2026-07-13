@@ -1989,6 +1989,11 @@ class LabelApp:
             job_btn_row, text="👁 ซ่อน/แสดง (อ่านแล้ว)", font=("Tahoma", fs(8)),
             command=lambda: toggle_hidden(),
         ).pack(side="left")
+        hide_all_btn = tk.Button(
+            job_btn_row, text="🗑 ซ่อนทั้งหมด (ไม่ลบถาวร)", font=("Tahoma", fs(8), "bold"), fg="white", bg="#b03a2e",
+            command=lambda: toggle_hide_all(),
+        )
+        hide_all_btn.pack(side="left", padx=(fs(6), 0))
         tk.Button(
             job_btn_row, text="✕ ลบถาวร", font=("Tahoma", fs(8), "bold"), fg="white", bg="#b03a2e",
             command=lambda: delete_job(),
@@ -2013,7 +2018,13 @@ class LabelApp:
                 if term:
                     jobs_raw = storage.search_print_jobs(term)
                 else:
-                    jobs_raw = storage.list_print_jobs(hours=24)
+                    # Archived jobs (bulk "start a new day" action) are kept
+                    # out of the default (unsearched) view so the button
+                    # actually clears the day's list - but they still surface
+                    # via a search (term branch above doesn't filter
+                    # archived). hidden (per-row "mark as read") is a
+                    # SEPARATE flag - never filtered, only dims the row below.
+                    jobs_raw = [j for j in storage.list_print_jobs(hours=24) if not j["archived"]]
             except Exception as e:
                 messagebox.showerror("โหลดไม่สำเร็จ", str(e), parent=win)
                 return
@@ -2117,6 +2128,23 @@ class LabelApp:
             if not messagebox.askyesno("ยืนยัน", f"ลบรายการของ '{who}' ถาวรใช่ไหม? กู้คืนไม่ได้", parent=win):
                 return
             storage.delete_print_job(job["id"])
+            refresh()
+
+        all_archived_state = {"archived": False}
+
+        def toggle_hide_all():
+            new_state = not all_archived_state["archived"]
+            if new_state:
+                if not messagebox.askyesno(
+                    "ยืนยัน",
+                    "ซ่อนรายการทั้งหมดที่เห็นตอนนี้ใช่ไหม? (ไม่ลบถาวร - ยังค้นหาย้อนหลังได้ปกติ "
+                    "กดปุ่มนี้ซ้ำเพื่อแสดงกลับได้ทุกเมื่อ)",
+                    parent=win,
+                ):
+                    return
+            storage.set_all_print_jobs_archived(new_state)
+            all_archived_state["archived"] = new_state
+            hide_all_btn.config(text="👁 แสดงทั้งหมด" if new_state else "🗑 ซ่อนทั้งหมด (ไม่ลบถาวร)")
             refresh()
 
         job_list.bind("<<ListboxSelect>>", on_job_select)
@@ -2367,7 +2395,7 @@ class LabelApp:
 
         win = tk.Toplevel(self.root)
         win.title("ชื่อผู้ป่วย")
-        win.geometry(f"{fs(360)}x{fs(280)}")
+        win.geometry(f"{fs(360)}x{fs(300)}")
         win.transient(self.root)
         win.grab_set()
 
@@ -2394,9 +2422,146 @@ class LabelApp:
             command=on_anon_toggle,
         ).pack(anchor="w", padx=fs(14))
 
-        tk.Label(win, text="เบอร์โทร (ไม่บังคับ)", font=("Tahoma", fs(10), "bold")).pack(anchor="w", padx=fs(14), pady=(fs(6), 0))
+        # Saving to a patient file is the uncommon case (most prints don't
+        # need it) - kept out of the default view entirely. The phone field
+        # and name/phone search-autocomplete only exist inside this popup,
+        # opened on demand, so the common no-save path never touches the DB
+        # with a search query.
         phone_var = tk.StringVar(value="")
-        tk.Entry(win, textvariable=phone_var, font=("Tahoma", fs(12))).pack(fill="x", padx=fs(14), pady=fs(4))
+        save_state = {"save": False}
+        save_status_var = tk.StringVar(value="")
+
+        save_row = tk.Frame(win)
+        save_row.pack(fill="x", padx=fs(14), pady=(fs(10), 0))
+        tk.Button(
+            save_row, text="💾 บันทึกลงแฟ้มผู้ป่วย", font=("Tahoma", fs(9), "bold"), fg="#1a5a9a",
+            command=lambda: open_save_popup(),
+        ).pack(side="left")
+
+        tk.Label(
+            win, textvariable=save_status_var, font=("Tahoma", fs(9), "bold"), fg="#1a7a4a",
+            wraplength=fs(320), justify="left",
+        ).pack(anchor="w", padx=fs(14), pady=(fs(2), 0))
+
+        def open_save_popup():
+            popup = tk.Toplevel(win)
+            popup.title("บันทึกลงแฟ้มผู้ป่วย")
+            popup.geometry(f"{fs(360)}x{fs(360)}")
+            popup.transient(win)
+            popup.grab_set()
+
+            tk.Label(popup, text="ชื่อ นามสกุล", font=("Tahoma", fs(10), "bold")).pack(anchor="w", padx=fs(14), pady=(fs(12), 0))
+            p_name_var = tk.StringVar(value=patient_var.get().strip())
+            p_name_entry = tk.Entry(popup, textvariable=p_name_var, font=("Tahoma", fs(12)))
+            p_name_entry.pack(fill="x", padx=fs(14), pady=fs(4))
+
+            # Autocomplete: suggest existing patients as the pharmacist
+            # types, so a returning patient's name+phone can be picked in
+            # one click instead of retyped (retyping is the #1 way
+            # name-matching to patient history silently breaks - a typo
+            # means it never links up later).
+            name_suggest = tk.Listbox(popup, font=("Tahoma", fs(9)), height=3, exportselection=False)
+            name_suggest.pack(fill="x", padx=fs(14))
+            name_suggest_results = []
+
+            def on_name_typed(*_a):
+                term = p_name_var.get().strip()
+                name_suggest.delete(0, tk.END)
+                name_suggest_results.clear()
+                if not term:
+                    return
+                try:
+                    name_suggest_results.extend(storage.search_patients(term, limit=6))
+                except Exception:
+                    return
+                for p in name_suggest_results:
+                    phone_part = f" - {p['phone']}" if p["phone"] else ""
+                    name_suggest.insert(tk.END, f"{p['name']}{phone_part}")
+
+            def on_name_pick(event=None):
+                sel = name_suggest.curselection()
+                if not sel:
+                    return
+                p = name_suggest_results[sel[0]]
+                p_name_var.set(p["name"])
+                p_phone_var.set(p["phone"])
+                name_suggest.delete(0, tk.END)
+                phone_suggest.delete(0, tk.END)
+
+            p_name_var.trace_add("write", on_name_typed)
+            name_suggest.bind("<<ListboxSelect>>", on_name_pick)
+
+            tk.Label(popup, text="เบอร์โทร", font=("Tahoma", fs(10), "bold")).pack(anchor="w", padx=fs(14), pady=(fs(6), 0))
+            p_phone_var = tk.StringVar(value=phone_var.get().strip())
+            tk.Entry(popup, textvariable=p_phone_var, font=("Tahoma", fs(12))).pack(fill="x", padx=fs(14), pady=fs(4))
+
+            phone_suggest = tk.Listbox(popup, font=("Tahoma", fs(9)), height=3, exportselection=False)
+            phone_suggest.pack(fill="x", padx=fs(14))
+            phone_suggest_results = []
+
+            def on_phone_typed(*_a):
+                term = p_phone_var.get().strip()
+                phone_suggest.delete(0, tk.END)
+                phone_suggest_results.clear()
+                if not term:
+                    return
+                try:
+                    phone_suggest_results.extend(storage.search_patients(term, limit=6))
+                except Exception:
+                    return
+                for p in phone_suggest_results:
+                    phone_part = f" - {p['phone']}" if p["phone"] else ""
+                    phone_suggest.insert(tk.END, f"{p['name']}{phone_part}")
+
+            def on_phone_pick(event=None):
+                sel = phone_suggest.curselection()
+                if not sel:
+                    return
+                p = phone_suggest_results[sel[0]]
+                p_name_var.set(p["name"])
+                p_phone_var.set(p["phone"])
+                phone_suggest.delete(0, tk.END)
+                name_suggest.delete(0, tk.END)
+
+            p_phone_var.trace_add("write", on_phone_typed)
+            phone_suggest.bind("<<ListboxSelect>>", on_phone_pick)
+
+            def confirm_save():
+                p_name = p_name_var.get().strip()
+                p_phone = p_phone_var.get().strip()
+                if not p_name and not p_phone:
+                    messagebox.showwarning("แจ้งเตือน", "กรุณาใส่ชื่อหรือเบอร์โทรก่อนบันทึก", parent=popup)
+                    return
+                if p_name and not p_phone:
+                    try:
+                        existing = storage.find_patients_by_exact_name(p_name)
+                    except Exception:
+                        existing = []
+                    if existing:
+                        messagebox.showwarning(
+                            "ชื่อนี้มีอยู่แล้ว",
+                            f"มีผู้ป่วยชื่อ \"{p_name}\" อยู่ในระบบแล้ว {len(existing)} คน "
+                            "กรุณาระบุเบอร์โทรเพื่อยืนยันว่าเป็นคนเดียวกัน (หรือคนละคน) ก่อนบันทึก",
+                            parent=popup,
+                        )
+                        return
+                patient_var.set(p_name)
+                phone_var.set(p_phone)
+                save_state["save"] = True
+                save_status_var.set("✓ จะบันทึกลงแฟ้ม: " + p_name + (f" - {p_phone}" if p_phone else ""))
+                popup.destroy()
+
+            btn_row = tk.Frame(popup)
+            btn_row.pack(pady=(fs(10), fs(10)))
+            tk.Button(
+                btn_row, text="ยืนยันบันทึก", font=("Tahoma", fs(10), "bold"), bg="#1a7a4a", fg="white",
+                command=confirm_save,
+            ).pack(side="left", padx=fs(4))
+            tk.Button(btn_row, text="ยกเลิก", font=("Tahoma", fs(10)), command=popup.destroy).pack(side="left", padx=fs(4))
+
+            popup.lift()
+            popup.focus_force()
+            p_name_entry.focus_set()
 
         status_var = tk.StringVar(value="")
         tk.Label(win, textvariable=status_var, font=("Tahoma", fs(9)), fg="#070", wraplength=fs(320)).pack(pady=(fs(4), 0))
@@ -2413,6 +2578,8 @@ class LabelApp:
             def worker():
                 try:
                     settings = app_settings.load_settings()
+                    if save_state["save"]:
+                        storage.find_or_create_patient(name, phone)
                     has_allergy = self.allergy_var.get()
                     for d in self.selected_drugs:
                         data = dict(d)
