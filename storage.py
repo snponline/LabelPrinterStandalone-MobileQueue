@@ -35,6 +35,14 @@ def _connect():
     existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(drug_templates)")}
     if "usage_mode" not in existing_cols:
         conn.execute("ALTER TABLE drug_templates ADD COLUMN usage_mode TEXT")
+    # barcode - for shops with a barcode scanner attached (scanning is just
+    # fast keystrokes + Enter, no special hardware handling needed) - lets
+    # search_templates() match a scanned code the same way it matches a
+    # typed name. Not unique-constrained: real-world data occasionally has
+    # a shared/reused code, and a soft duplicate shouldn't block a save.
+    if "barcode" not in existing_cols:
+        conn.execute("ALTER TABLE drug_templates ADD COLUMN barcode TEXT")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_drug_templates_barcode ON drug_templates(barcode)")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS print_queue (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -132,23 +140,45 @@ def _connect():
 
 
 def search_templates(term, limit=30):
-    """Prefix-priority search over saved drug1 names (ชื่อการค้า)."""
+    """Prefix-priority search over saved drug1 names (ชื่อการค้า) - also
+    matches barcode, so scanning one (a barcode scanner is just a fast
+    keyboard + Enter, nothing special to handle) surfaces the same result
+    a manual name search would."""
     term = (term or "").strip()
     if not term:
         return []
     conn = _connect()
     try:
         cur = conn.cursor()
+        like = f"%{term}%"
         cur.execute(
             """
             SELECT id, drug1 FROM drug_templates
-            WHERE drug1 LIKE ?
+            WHERE drug1 LIKE ? OR barcode LIKE ?
             ORDER BY CASE WHEN drug1 LIKE ? THEN 0 ELSE 1 END, drug1
             LIMIT ?
             """,
-            (f"%{term}%", f"{term}%", limit),
+            (like, like, f"{term}%", limit),
         )
         return [{"idproduct": row[0], "name": row[1]} for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def find_template_by_barcode(barcode):
+    """Exact match only - used to auto-add a drug the instant a barcode is
+    scanned into the search box (Enter key), skipping the usual
+    double-click-a-result step. Returns None for no match OR more than one
+    (an ambiguous scan shouldn't silently pick one)."""
+    barcode = (barcode or "").strip()
+    if not barcode:
+        return None
+    conn = _connect()
+    try:
+        rows = conn.execute("SELECT id, drug1 FROM drug_templates WHERE barcode = ?", (barcode,)).fetchall()
+        if len(rows) != 1:
+            return None
+        return {"idproduct": rows[0][0], "name": rows[0][1]}
     finally:
         conn.close()
 
@@ -170,14 +200,14 @@ def get_template(idproduct):
     try:
         cur = conn.cursor()
         cur.execute(
-            "SELECT drug1, drug2, note, qty, unit, per_day, every_hr, meal, times, extra_labels, usage_mode "
+            "SELECT drug1, drug2, note, qty, unit, per_day, every_hr, meal, times, extra_labels, usage_mode, barcode "
             "FROM drug_templates WHERE id = ?",
             (idproduct,),
         )
         row = cur.fetchone()
         if not row:
             return None
-        drug1, drug2, note, qty, unit, per_day, every_hr, meal, times_json, extra_json, usage_mode = row
+        drug1, drug2, note, qty, unit, per_day, every_hr, meal, times_json, extra_json, usage_mode, barcode = row
         return {
             "drug1": drug1, "drug2": drug2 or "", "note": note or "",
             "qty": qty or "", "unit": unit or "", "per_day": per_day or "",
@@ -185,6 +215,7 @@ def get_template(idproduct):
             "times": json.loads(times_json) if times_json else [],
             "extra_labels": json.loads(extra_json) if extra_json else [],
             "usage_mode": usage_mode or "oral",
+            "barcode": barcode or "",
         }
     finally:
         conn.close()
@@ -202,30 +233,31 @@ def upsert_template(idproduct, drug):
         times_json = json.dumps(drug.get("times") or [], ensure_ascii=False)
         extra_json = json.dumps(drug.get("extra_labels") or [], ensure_ascii=False)
         usage_mode = drug.get("usage_mode", "oral")
+        barcode = (drug.get("barcode") or "").strip()
         now = datetime.now().isoformat()
         if idproduct:
             cur.execute(
                 """
                 UPDATE drug_templates SET
                     drug1 = ?, drug2 = ?, note = ?, qty = ?, unit = ?, per_day = ?,
-                    every_hr = ?, meal = ?, times = ?, extra_labels = ?, usage_mode = ?, updated_at = ?
+                    every_hr = ?, meal = ?, times = ?, extra_labels = ?, usage_mode = ?, barcode = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (drug["drug1"], drug.get("drug2", ""), drug.get("note", ""), drug.get("qty", ""),
                  drug.get("unit", ""), drug.get("per_day", ""), drug.get("every_hr", ""),
-                 drug.get("meal", ""), times_json, extra_json, usage_mode, now, idproduct),
+                 drug.get("meal", ""), times_json, extra_json, usage_mode, barcode, now, idproduct),
             )
             row_id = idproduct
         else:
             cur.execute(
                 """
                 INSERT INTO drug_templates
-                    (drug1, drug2, note, qty, unit, per_day, every_hr, meal, times, extra_labels, usage_mode, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (drug1, drug2, note, qty, unit, per_day, every_hr, meal, times, extra_labels, usage_mode, barcode, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (drug["drug1"], drug.get("drug2", ""), drug.get("note", ""), drug.get("qty", ""),
                  drug.get("unit", ""), drug.get("per_day", ""), drug.get("every_hr", ""),
-                 drug.get("meal", ""), times_json, extra_json, usage_mode, now),
+                 drug.get("meal", ""), times_json, extra_json, usage_mode, barcode, now),
             )
             row_id = cur.lastrowid
         conn.commit()
@@ -234,40 +266,49 @@ def upsert_template(idproduct, drug):
         conn.close()
 
 
-def bulk_import_names(names):
-    """Create blank drug templates (ชื่อการค้า only, everything else empty)
-    for an Excel import. Names that already exist are left untouched - this
-    never overwrites dosing info a pharmacist already entered. Returns
-    (imported, skipped_existing, skipped_blank)."""
+def bulk_import_names_and_barcodes(rows):
+    """rows: list of (name, barcode) tuples from an Excel import that has
+    both columns (barcode may be blank per-row, or the whole column may be
+    absent - see read_excel_drug_names_and_barcodes()). Handles two cases
+    with one code path, since they're really the same operation: (1) a
+    fresh import where most names are brand new - creates a blank template
+    set too; (2) adding barcodes to drugs that already exist and already
+    have dosing filled in - touches ONLY the barcode column on a name match,
+    never overwrites drug2/qty/per_day/etc. Returns
+    (created, updated_barcode, skipped_blank)."""
     conn = _connect()
-    imported = skipped_existing = skipped_blank = 0
+    created = updated_barcode = skipped_blank = 0
     try:
         cur = conn.cursor()
         now = datetime.now().isoformat()
         seen_this_batch = set()
-        for raw in names:
-            name = (raw or "").strip()
+        for raw_name, raw_barcode in rows:
+            name = (raw_name or "").strip()
+            barcode = (raw_barcode or "").strip()
             if not name or name in seen_this_batch:
                 skipped_blank += 1
                 continue
             seen_this_batch.add(name)
             cur.execute("SELECT id FROM drug_templates WHERE drug1 = ?", (name,))
-            if cur.fetchone():
-                skipped_existing += 1
-                continue
-            cur.execute(
-                """
-                INSERT INTO drug_templates
-                    (drug1, drug2, note, qty, unit, per_day, every_hr, meal, times, extra_labels, updated_at)
-                VALUES (?, '', '', '', '', '', '', '', '[]', '[]', ?)
-                """,
-                (name, now),
-            )
-            imported += 1
+            existing = cur.fetchone()
+            if existing:
+                if barcode:
+                    cur.execute("UPDATE drug_templates SET barcode = ? WHERE id = ?", (barcode, existing[0]))
+                    updated_barcode += 1
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO drug_templates
+                        (drug1, drug2, note, qty, unit, per_day, every_hr, meal, times, extra_labels, barcode, updated_at)
+                    VALUES (?, '', '', '', '', '', '', '', '[]', '[]', ?, ?)
+                    """,
+                    (name, barcode, now),
+                )
+                created += 1
         conn.commit()
     finally:
         conn.close()
-    return imported, skipped_existing, skipped_blank
+    return created, updated_barcode, skipped_blank
 
 
 def delete_template(idproduct):

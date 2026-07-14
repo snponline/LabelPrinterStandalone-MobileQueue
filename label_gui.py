@@ -28,6 +28,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageWin, ImageTk
 import storage
 import app_settings
 import local_server
+import ai_assist
 
 FAVORITES_PATH = os.path.join(storage.APP_DATA_DIR, "favorites.json")
 DEBUG_PREVIEW_PATH = os.path.join(storage.APP_DATA_DIR, "_last_label_preview.png")
@@ -49,7 +50,7 @@ def save_favorites(favorites):
         json.dump(favorites, f, ensure_ascii=False, indent=2)
 
 
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.11.0"
 
 DOTS_PER_MM = 8  # matches standard 203dpi thermal label printers
 
@@ -77,6 +78,11 @@ EXTRA_LABEL_OPTIONS_BY_MODE = {
     ],
 }
 MAX_EXTRA_LABELS = 2
+# Longest a free-typed extra label can be before it'd force the label
+# renderer to shrink below a comfortable reading size - measured against the
+# widest Thai glyphs at the extra-labels' starting font size (24pt bold) on
+# a default 80mm-wide label, with a small safety margin.
+MAX_CUSTOM_EXTRA_LABEL_CHARS = 30
 
 USAGE_MODES = ["oral", "topical", "drops"]
 USAGE_MODE_LABELS = {"oral": "ยากิน", "topical": "ยาทา", "drops": "ยาหยอด"}
@@ -112,6 +118,7 @@ def save_product_med_info(idproduct, drug):
 
 
 DEFAULT_EXCEL_NAME_COLUMNS = ["ชื่อการค้า", "ชื่อสินค้า", "ชื่อยา"]
+DEFAULT_EXCEL_BARCODE_COLUMNS = ["บาร์โค้ด", "Barcode", "barcode"]
 
 
 def export_backup(zip_path):
@@ -154,24 +161,32 @@ def import_backup(zip_path):
 _MAX_HEADER_SCAN_ROWS = 10
 
 
-def read_excel_drug_names(path, column_name=None):
-    """Read one column of drug trade names out of the first sheet of an
-    .xlsx file. Scans the first several rows (not just row 1) for a header
-    match - some exported files have a title row or blank row above the
-    real header - matching case-insensitively and ignoring extra spaces.
-    If column_name is blank, tries DEFAULT_EXCEL_NAME_COLUMNS in order.
-    Raises ValueError with a Thai message (including what headers were
-    actually seen) if no matching column is found."""
+def read_excel_drug_names_and_barcodes(path, name_column=None, barcode_column=None):
+    """Read drug trade names (and an optional barcode column on the same
+    header row) out of the first sheet of an .xlsx file - covers both a
+    fresh import (names + barcodes together) and adding barcodes to drugs
+    that already exist (see storage.bulk_import_names_and_barcodes(), which
+    treats a name match as "update barcode only, don't touch dosing").
+    Scans the first several rows (not just row 1) for a header match - some
+    exported files have a title row or blank row above the real header -
+    matching case-insensitively and ignoring extra spaces. If name_column is
+    blank, tries DEFAULT_EXCEL_NAME_COLUMNS in order; same for
+    barcode_column/DEFAULT_EXCEL_BARCODE_COLUMNS, except the barcode column
+    is best-effort - if it can't be found, every row's barcode is just
+    empty. Raises ValueError with a Thai message (including what headers
+    were actually seen) only if the NAME column can't be found."""
     from openpyxl import load_workbook
     wb = load_workbook(path, read_only=True, data_only=True)
     ws = wb.active
     rows = ws.iter_rows(values_only=True)
 
-    column_name = (column_name or "").strip()
-    candidates = [column_name] if column_name else DEFAULT_EXCEL_NAME_COLUMNS
-    candidates_lower = [c.lower() for c in candidates]
+    name_column = (name_column or "").strip()
+    name_candidates_lower = [c.lower() for c in ([name_column] if name_column else DEFAULT_EXCEL_NAME_COLUMNS)]
+    barcode_column = (barcode_column or "").strip()
+    barcode_candidates_lower = [c.lower() for c in ([barcode_column] if barcode_column else DEFAULT_EXCEL_BARCODE_COLUMNS)]
 
-    idx = None
+    name_idx = None
+    barcode_idx = None
     header_row_num = None
     scanned_headers = []
     for row_num, row in enumerate(rows, start=1):
@@ -180,15 +195,21 @@ def read_excel_drug_names(path, column_name=None):
         header = [str(h).strip() if h is not None else "" for h in row]
         header_lower = [h.lower() for h in header]
         scanned_headers.append((row_num, header))
-        for cand_lower in candidates_lower:
+        for cand_lower in name_candidates_lower:
             if cand_lower in header_lower:
-                idx = header_lower.index(cand_lower)
+                name_idx = header_lower.index(cand_lower)
                 header_row_num = row_num
                 break
-        if idx is not None:
+        if name_idx is not None:
+            # barcode column (if present) is expected on this same header
+            # row - a real Excel file only has one header row
+            for cand_lower in barcode_candidates_lower:
+                if cand_lower in header_lower:
+                    barcode_idx = header_lower.index(cand_lower)
+                    break
             break
 
-    if idx is None:
+    if name_idx is None:
         hint = (
             f"\n** ตรวจสอบว่าชื่อ column ที่พิมพ์ ตรงกับหัวตารางในไฟล์ Excel เป๊ะๆ "
             f"(เช็คให้แล้ว {_MAX_HEADER_SCAN_ROWS} แถวแรกของไฟล์ ไม่ต้องอยู่แถว 1 พอดีก็ได้) **"
@@ -196,23 +217,26 @@ def read_excel_drug_names(path, column_name=None):
         seen = "; ".join(
             f"แถว {n}: {', '.join(h) if any(h) else '(ว่างเปล่า)'}" for n, h in scanned_headers
         )
-        if column_name:
-            raise ValueError(f"ไม่พบ column ชื่อ '{column_name}' ในไฟล์ (เช็คแล้ว {len(scanned_headers)} แถวแรก - {seen}){hint}")
+        if name_column:
+            raise ValueError(f"ไม่พบ column ชื่อ '{name_column}' ในไฟล์ (เช็คแล้ว {len(scanned_headers)} แถวแรก - {seen}){hint}")
         raise ValueError(
             "ไม่พบ column ชื่อ " + "/".join(DEFAULT_EXCEL_NAME_COLUMNS) +
             f" ในไฟล์ (เช็คแล้ว {len(scanned_headers)} แถวแรก - {seen}) กรุณาระบุชื่อ column เอง{hint}"
         )
 
-    names = []
-    # re-open since the row iterator above already consumed rows up to the header
+    rows_out = []
     wb2 = load_workbook(path, read_only=True, data_only=True)
     ws2 = wb2.active
     for row_num, row in enumerate(ws2.iter_rows(values_only=True), start=1):
         if row_num <= header_row_num:
             continue
-        if idx < len(row) and row[idx] is not None:
-            names.append(str(row[idx]))
-    return names
+        if name_idx < len(row) and row[name_idx] is not None:
+            name = str(row[name_idx])
+            barcode = ""
+            if barcode_idx is not None and barcode_idx < len(row) and row[barcode_idx] is not None:
+                barcode = str(row[barcode_idx])
+            rows_out.append((name, barcode))
+    return rows_out
 
 
 def find_font(size, bold=False):
@@ -637,6 +661,17 @@ def build_settings_dialog(parent, first_run=False):
     pharm_var = tk.StringVar(value=settings["pharmacist_names"])
     tk.Entry(win, textvariable=pharm_var, font=("Tahoma", fs(11))).pack(fill="x", **pad)
 
+    tk.Label(
+        win, text="API Key สำหรับ AI ช่วยค้นข้อมูล (ไม่บังคับ - ใส่เฉพาะตัวที่จะใช้)",
+        font=("Tahoma", fs(10), "bold"), wraplength=fs(400), justify="left",
+    ).pack(anchor="w", **pad)
+    ai_key_vars = {}
+    for provider_key, provider_info in ai_assist.PROVIDERS.items():
+        tk.Label(win, text=provider_info["label"], font=("Tahoma", fs(9))).pack(anchor="w", padx=fs(10))
+        v = tk.StringVar(value=settings.get(provider_info["key_field"], ""))
+        ai_key_vars[provider_key] = v
+        tk.Entry(win, textvariable=v, font=("Tahoma", fs(10)), show="•").pack(fill="x", padx=fs(10), pady=(0, fs(4)))
+
     status_var = tk.StringVar(value="")
     tk.Label(win, textvariable=status_var, font=("Tahoma", fs(9)), fg="#a00",
              wraplength=fs(400), justify="left").pack(padx=fs(10))
@@ -660,6 +695,7 @@ def build_settings_dialog(parent, first_run=False):
             "address_line2": addr2_var.get().strip(),
             "phone": phone_var.get().strip(),
             "pharmacist_names": pharm_var.get().strip(),
+            **{ai_assist.PROVIDERS[k]["key_field"]: v.get().strip() for k, v in ai_key_vars.items()},
         })
         win.destroy()
 
@@ -751,7 +787,8 @@ class LabelApp:
     def __init__(self, root):
         self.root = root
         root.title(f"พิมพ์ฉลากยา v{APP_VERSION}")
-        root.geometry(f"{fs(1050)}x{fs(700)}")
+        root.geometry(f"{fs(1050)}x{fs(700)}")  # fallback size if un-maximized later
+        root.state("zoomed")  # start maximized - the toolbar row doesn't fit at the old default size
         # ttk.Combobox's dropdown popup is a separate internal Listbox that
         # doesn't inherit the widget's own font= option - has to be set via
         # the option database to make dropdown list text bigger too.
@@ -812,12 +849,18 @@ class LabelApp:
             search_header, text="🗂 ประวัติผู้ป่วย", font=("Tahoma", fs(9)),
             command=self.open_patient_profile_dialog,
         ).pack(side="right", padx=(0, fs(6)))
+        tk.Button(
+            search_header, text="🤖 AI ช่วยค้นข้อมูล", font=("Tahoma", fs(9)),
+            command=self.open_ai_assist_dialog,
+        ).pack(side="right", padx=(0, fs(6)))
 
         search_row = tk.Frame(left_frame)
         search_row.pack(fill="x", **pad)
         self.search_var = tk.StringVar()
         self.search_var.trace_add("write", self.on_search_change)
-        tk.Entry(search_row, textvariable=self.search_var, font=("Tahoma", fs(11))).pack(side="left", fill="x", expand=True)
+        search_entry = tk.Entry(search_row, textvariable=self.search_var, font=("Tahoma", fs(11)))
+        search_entry.pack(side="left", fill="x", expand=True)
+        search_entry.bind("<Return>", self.on_search_enter)
         tk.Button(
             search_row, text="✕", font=("Tahoma", fs(9), "bold"), fg="white", bg="#555555", width=2,
             command=lambda: self.search_var.set(""),
@@ -847,7 +890,8 @@ class LabelApp:
 
         list_header = tk.Frame(left_frame)
         list_header.pack(fill="x", **pad)
-        tk.Label(list_header, text="รายการยาที่จะพิมพ์ (เขียว = บันทึกไว้แล้ว, ส้ม = แก้ไขแต่ยังไม่ได้ save, แดง = ยังไม่มีข้อมูล, ดับเบิลคลิกเพื่อแก้ไข)",
+        tk.Label(list_header, text="รายการยาที่จะพิมพ์ (เขียว = บันทึกไว้แล้ว, ส้ม = แก้ไขแต่ยังไม่ได้ save, "
+                                    "เหลือง = ใช้ค่าเฉพาะ Favorite นี้, แดง = ยังไม่มีข้อมูล, ดับเบิลคลิกเพื่อแก้ไข)",
                  font=("Tahoma", fs(9), "bold"), wraplength=fs(340), justify="left").pack(side="left", anchor="w")
         tk.Button(
             list_header, text="🗑 ล้างทั้งหมด", font=("Tahoma", fs(9)),
@@ -961,6 +1005,30 @@ class LabelApp:
         if self._search_after_id:
             self.root.after_cancel(self._search_after_id)
         self._search_after_id = self.root.after(300, self.do_search)
+
+    def on_search_enter(self, event=None):
+        """A barcode scanner is just a fast keyboard that types the code
+        then sends Enter - so Enter in this box is the natural place to
+        check "does this exactly match one barcode?" and skip straight to
+        adding it, instead of making the pharmacist scan then still have to
+        double-click a search result."""
+        term = self.search_var.get().strip()
+        if not term:
+            return
+        match = storage.find_template_by_barcode(term)
+        if not match:
+            return
+        self.search_var.set("")
+
+        def worker():
+            try:
+                info = get_product_med_info(match["idproduct"])
+            except Exception as e:
+                self.root.after(0, lambda: self.status_var.set(f"เกิดข้อผิดพลาด: {e}"))
+                return
+            self.root.after(0, lambda: self.add_drug(match, info))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def do_search(self):
         term = self.search_var.get().strip()
@@ -1078,6 +1146,7 @@ class LabelApp:
                 "times": list(info["times"]),
                 "extra_labels": list(info.get("extra_labels") or []),
                 "usage_mode": info.get("usage_mode", "oral"),
+                "barcode": info.get("barcode", ""),
                 "status": "db",
                 "print_qty": 1,
             }
@@ -1089,6 +1158,7 @@ class LabelApp:
                 "per_day": "", "every_hr": "", "meal": "หลังอาหาร", "times": [],
                 "extra_labels": [],
                 "usage_mode": (info.get("usage_mode", "oral") if info else "oral"),
+                "barcode": (info.get("barcode", "") if info else ""),
                 "status": "missing",
                 "print_qty": 1,
             }
@@ -1105,7 +1175,8 @@ class LabelApp:
         entry = {
             "idproduct": None, "drug1": "", "drug2": "", "note": "", "qty": "",
             "unit": "เม็ด", "per_day": "", "every_hr": "", "meal": "หลังอาหาร",
-            "times": [], "extra_labels": [], "usage_mode": "oral", "status": "missing", "print_qty": 1,
+            "times": [], "extra_labels": [], "usage_mode": "oral", "barcode": "",
+            "status": "missing", "print_qty": 1,
         }
         self.selected_drugs.append(entry)
         index = len(self.selected_drugs) - 1
@@ -1118,15 +1189,17 @@ class LabelApp:
         elsewhere. Never overwrites a drug that's already saved."""
         win = tk.Toplevel(self.root)
         win.title("Import รายชื่อยาจาก Excel")
-        win.geometry(f"{fs(440)}x{fs(400)}")
+        win.geometry(f"{fs(440)}x{fs(480)}")
         win.transient(self.root)
         win.grab_set()
 
         pad = {"padx": fs(10), "pady": fs(4)}
 
         tk.Label(
-            win, text="เลือกไฟล์ Excel (.xlsx) ที่มีรายชื่อยา - จะสร้างรายการเปล่าให้แต่ละชื่อ "
-                       "(ยังไม่มีวิธีใช้ กรอกเพิ่มทีหลังได้) ยาที่มีอยู่แล้วจะไม่ถูกเขียนทับ",
+            win, text="เลือกไฟล์ Excel (.xlsx) ที่มีรายชื่อยา (และบาร์โค้ดถ้ามี) - ยาที่ยังไม่มีในเครื่องจะถูก"
+                       "สร้างรายการเปล่าให้ (ยังไม่มีวิธีใช้ กรอกเพิ่มทีหลังได้) ส่วนยาที่มีอยู่แล้วจะ"
+                       "**ไม่ถูกเขียนทับ** - ยกเว้นคอลัมน์บาร์โค้ดที่จะอัปเดตให้ถ้าไฟล์มีค่าใหม่มา "
+                       "(ใช้ไฟล์นี้เพิ่มบาร์โค้ดให้ยาที่กรอกวิธีใช้ไว้แล้วได้เลย โดยไม่กระทบข้อมูลเดิม)",
             font=("Tahoma", fs(9), "bold"), wraplength=fs(400), justify="left",
         ).pack(anchor="w", **pad)
 
@@ -1153,6 +1226,14 @@ class LabelApp:
         column_var = tk.StringVar(value="")
         tk.Entry(win, textvariable=column_var, font=("Tahoma", fs(10))).pack(fill="x", **pad)
 
+        tk.Label(
+            win, text=f"ชื่อ column ที่เก็บบาร์โค้ด (ไม่บังคับ - เว้นว่างได้ จะลองหา "
+                       f"{', '.join(DEFAULT_EXCEL_BARCODE_COLUMNS)} ให้อัตโนมัติ ถ้าไม่มีในไฟล์ก็ไม่เป็นไร)",
+            font=("Tahoma", fs(9), "bold"), wraplength=fs(400), justify="left",
+        ).pack(anchor="w", **pad)
+        barcode_column_var = tk.StringVar(value="")
+        tk.Entry(win, textvariable=barcode_column_var, font=("Tahoma", fs(10))).pack(fill="x", **pad)
+
         status_var = tk.StringVar(value="")
         tk.Label(win, textvariable=status_var, font=("Tahoma", fs(14), "bold"), fg="#a00",
                  wraplength=fs(400), justify="left").pack(**pad)
@@ -1167,13 +1248,13 @@ class LabelApp:
 
             def worker():
                 try:
-                    names = read_excel_drug_names(path, column_var.get())
+                    rows = read_excel_drug_names_and_barcodes(path, column_var.get(), barcode_column_var.get())
                 except Exception as e:
                     self.root.after(0, lambda: status_var.set(f"อ่านไฟล์ไม่สำเร็จ: {e}"))
                     self.root.after(0, lambda: import_btn.config(state="normal"))
                     return
                 try:
-                    imported, skipped_existing, skipped_blank = storage.bulk_import_names(names)
+                    created, updated_barcode, skipped_blank = storage.bulk_import_names_and_barcodes(rows)
                 except Exception as e:
                     self.root.after(0, lambda: status_var.set(f"บันทึกไม่สำเร็จ: {e}"))
                     self.root.after(0, lambda: import_btn.config(state="normal"))
@@ -1182,12 +1263,12 @@ class LabelApp:
                 def done():
                     messagebox.showinfo(
                         "สำเร็จ",
-                        f"Import เสร็จแล้ว\nเพิ่มใหม่: {imported} รายการ\n"
-                        f"ข้าม (มีอยู่แล้ว): {skipped_existing} รายการ\n"
+                        f"Import เสร็จแล้ว\nเพิ่มใหม่: {created} รายการ\n"
+                        f"อัปเดตบาร์โค้ด (ยาที่มีอยู่แล้ว): {updated_barcode} รายการ\n"
                         f"ข้าม (ชื่อซ้ำ/ว่างในไฟล์): {skipped_blank} รายการ",
                         parent=win,
                     )
-                    self.status_var.set(f"Import จาก Excel สำเร็จ: เพิ่มยาใหม่ {imported} รายการ")
+                    self.status_var.set(f"Import จาก Excel สำเร็จ: เพิ่มยาใหม่ {created} รายการ")
                     win.destroy()
                 self.root.after(0, done)
 
@@ -1206,8 +1287,8 @@ class LabelApp:
         for widget in self.list_frame.winfo_children():
             widget.destroy()
 
-        marks = {"db": "✓", "edited": "✎", "missing": "✗"}
-        colors = {"db": "#1a7a4a", "edited": "#c07a17", "missing": "#b03a2e"}
+        marks = {"db": "✓", "edited": "✎", "missing": "✗", "override": "★"}
+        colors = {"db": "#1a7a4a", "edited": "#c07a17", "missing": "#b03a2e", "override": "#b8960c"}
 
         for i, d in enumerate(self.selected_drugs):
             row = tk.Frame(self.list_frame)
@@ -1334,6 +1415,16 @@ class LabelApp:
         def worker():
             loaded = []
             for entry in saved_entries:
+                # An override entry was deliberately frozen at save-favorite
+                # time (see on_save_favorite) specifically so it does NOT get
+                # clobbered by whatever the DB template currently says - skip
+                # the refresh entirely and trust the favorite's own copy.
+                if entry.get("override"):
+                    entry["status"] = "override"
+                    entry.setdefault("usage_mode", "oral")
+                    entry.setdefault("print_qty", 1)
+                    loaded.append(entry)
+                    continue
                 info = None
                 if entry.get("idproduct") is not None:
                     try:
@@ -1356,6 +1447,7 @@ class LabelApp:
                     entry["times"] = list(info["times"])
                     entry["extra_labels"] = list(info.get("extra_labels") or [])
                     entry["usage_mode"] = info.get("usage_mode", "oral")
+                    entry["barcode"] = info.get("barcode", "")
                     entry["status"] = "db"
                 else:
                     entry["status"] = "missing"
@@ -1395,7 +1487,20 @@ class LabelApp:
         if name in self.favorites:
             if not messagebox.askyesno("แจ้งเตือน", f"มี Favorite ชื่อ '{name}' อยู่แล้ว ต้องการเขียนทับไหม?"):
                 return
-        self.favorites[name] = [dict(d) for d in self.selected_drugs]
+        # A drug edited away from its DB default (orange "edited") gets
+        # frozen into this favorite as an "override" - on_load_favorite()
+        # will skip re-fetching it from the DB template next time, so a
+        # dose customized specifically for this combo doesn't get silently
+        # thrown away the way it used to (every load unconditionally
+        # overwrote with the current global template). A drug that matches
+        # the DB (or has no data at all) has nothing to protect, so it stays
+        # non-override and keeps auto-refreshing from the DB as before.
+        snapshot = []
+        for d in self.selected_drugs:
+            entry = dict(d)
+            entry["override"] = d.get("status") == "edited"
+            snapshot.append(entry)
+        self.favorites[name] = snapshot
         save_favorites(self.favorites)
         self.refresh_fav_buttons()
         self.status_var.set(f"บันทึก Favorite '{name}' แล้ว ({len(self.selected_drugs)} รายการยา)")
@@ -1653,6 +1758,9 @@ class LabelApp:
             extra_info = info.get("extra_labels") or []
             for opt, v in target_vars["extra_vars"].items():
                 v.set(opt in extra_info)
+            custom_candidate = next((e for e in extra_info if e not in target_vars["extra_vars"]), "")
+            target_vars["custom_var"].set(bool(custom_candidate))
+            target_vars["custom_text_var"].set(custom_candidate)
             win.destroy()
             messagebox.showinfo(
                 "สำเร็จ", f"Copy ข้อมูลจาก '{product['name']}' มาแล้ว (ยกเว้นชื่อการค้า)", parent=parent_win,
@@ -1683,15 +1791,20 @@ class LabelApp:
         d = self.selected_drugs[index]
         win = tk.Toplevel(self.root)
         win.title(f"แก้ไขข้อมูลยา - {d['drug1'] or '(ยาใหม่)'}")
-        win.geometry(f"{fs(440)}x{fs(720)}")
+        win.geometry(f"{fs(590)}x{fs(720)}")  # 440 * 4/3 - room for a 3-column ฉลากเสริม grid
         win.transient(self.root)
         win.grab_set()
 
         pad = {"padx": fs(10), "pady": fs(4)}
 
         tk.Label(win, text="ชื่อการค้า *", font=("Tahoma", fs(10), "bold")).pack(anchor="w", **pad)
+        name_row = tk.Frame(win)
+        name_row.pack(fill="x", **pad)
         drug1_var = tk.StringVar(value=d["drug1"])
-        tk.Entry(win, textvariable=drug1_var, font=("Tahoma", fs(11))).pack(fill="x", **pad)
+        tk.Entry(name_row, textvariable=drug1_var, font=("Tahoma", fs(11))).pack(side="left", fill="x", expand=True)
+        tk.Label(name_row, text="บาร์โค้ด:", font=("Tahoma", fs(9))).pack(side="left", padx=(fs(6), fs(2)))
+        barcode_var = tk.StringVar(value=d.get("barcode", ""))
+        tk.Entry(name_row, textvariable=barcode_var, font=("Tahoma", fs(11)), width=14).pack(side="left")
 
         tk.Label(win, text="ประเภทการใช้ยา", font=("Tahoma", fs(10), "bold")).pack(anchor="w", **pad)
         mode_var = tk.StringVar(value=d.get("usage_mode", "oral"))
@@ -1713,7 +1826,7 @@ class LabelApp:
                 "every_hr": every_hr_var.get().strip() if every_hr_enabled_var.get() else "",
                 "meal": meal_var.get().strip(),
                 "times": [t for t, v in time_vars.items() if v.get()],
-                "extra_labels": [opt for opt, v in extra_vars.items() if v.get()],
+                "extra_labels": collect_extra_labels(),
                 "usage_mode": mode_var.get(),
             }
 
@@ -1727,6 +1840,7 @@ class LabelApp:
                 "every_hr_enabled_var": every_hr_enabled_var,
                 "meal_var": meal_var, "meal_display_var": meal_display_var,
                 "time_vars": time_vars, "extra_vars": extra_vars,
+                "custom_var": custom_var, "custom_text_var": custom_text_var,
                 "mode_var": mode_var, "mode_display_var": mode_display_var,
                 "render_dose_fields": lambda: render_dose_fields(),
                 "render_extra_fields": lambda: render_extra_fields(),
@@ -1823,12 +1937,43 @@ class LabelApp:
         extra_section = tk.Frame(win)
         extra_section.pack(fill="x", **pad)
         extra_vars = {}
+        # Free-text extra label ("อื่นๆ (พิมพ์เอง)") - a checkbox + entry pair
+        # that isn't tied to any one usage mode's preset list, so these two
+        # Variables are created once (not per render_extra_fields() call like
+        # extra_vars is) and just get re-attached to fresh widgets each time,
+        # so typed text survives a mode switch instead of getting wiped.
+        custom_var = tk.BooleanVar(value=False)
+        custom_text_var = tk.StringVar(value="")
+        _custom_len_vcmd = (win.register(lambda P: len(P) <= MAX_CUSTOM_EXTRA_LABEL_CHARS), "%P")
 
-        def on_extra_toggle(changed_label):
-            checked = [lbl for lbl, v in extra_vars.items() if v.get()]
-            if len(checked) > MAX_EXTRA_LABELS:
-                extra_vars[changed_label].set(False)
+        def _init_custom_from_d():
+            all_presets = {opt for opts in EXTRA_LABEL_OPTIONS_BY_MODE.values() for opt in opts}
+            existing_extra = d.get("extra_labels") or []
+            custom_existing = next((e for e in existing_extra if e not in all_presets), "")
+            custom_var.set(bool(custom_existing))
+            custom_text_var.set(custom_existing)
+
+        _init_custom_from_d()
+
+        def checked_extra_count():
+            return sum(1 for v in extra_vars.values() if v.get()) + (1 if custom_var.get() else 0)
+
+        def collect_extra_labels():
+            extra = [opt for opt, v in extra_vars.items() if v.get()]
+            custom_text = custom_text_var.get().strip()
+            if custom_var.get() and custom_text:
+                extra.append(custom_text)
+            return extra
+
+        def on_extra_toggle(changed_key):
+            if checked_extra_count() > MAX_EXTRA_LABELS:
+                if changed_key == "__custom__":
+                    custom_var.set(False)
+                else:
+                    extra_vars[changed_key].set(False)
                 messagebox.showwarning("แจ้งเตือน", f"เลือกฉลากเสริมได้สูงสุด {MAX_EXTRA_LABELS} ข้อ", parent=win)
+
+        EXTRA_GRID_COLUMNS = 3
 
         def render_extra_fields():
             for w in extra_section.winfo_children():
@@ -1836,17 +1981,36 @@ class LabelApp:
             extra_vars.clear()
             options = EXTRA_LABEL_OPTIONS_BY_MODE.get(mode_var.get(), EXTRA_LABEL_OPTIONS_BY_MODE["oral"])
             existing_extra = d.get("extra_labels") or []
-            extra_section.grid_columnconfigure(0, weight=1)
-            extra_section.grid_columnconfigure(1, weight=1)
+            for col in range(EXTRA_GRID_COLUMNS):
+                extra_section.grid_columnconfigure(col, weight=1)
             for i, opt in enumerate(options):
                 v = tk.BooleanVar(value=opt in existing_extra)
                 extra_vars[opt] = v
-                row, col = divmod(i, 2)
+                row, col = divmod(i, EXTRA_GRID_COLUMNS)
                 tk.Checkbutton(
                     extra_section, text=opt, variable=v, font=("Tahoma", fs(9)),
-                    anchor="w", justify="left", wraplength=fs(180),
+                    anchor="w", justify="left", wraplength=fs(150),
                     command=lambda o=opt: on_extra_toggle(o),
                 ).grid(row=row, column=col, sticky="w", padx=(0, fs(4)))
+            # If the last grid row has an empty column, tuck the custom
+            # checkbox in there instead of always starting a fresh row -
+            # saves a row of height whenever the preset count doesn't land
+            # on an exact multiple of EXTRA_GRID_COLUMNS.
+            n = len(options)
+            last_row = (n - 1) // EXTRA_GRID_COLUMNS if n else 0
+            last_row_count = n - last_row * EXTRA_GRID_COLUMNS
+            if n and last_row_count < EXTRA_GRID_COLUMNS:
+                custom_row, custom_col, custom_colspan = last_row, last_row_count, 1
+            else:
+                custom_row, custom_col, custom_colspan = last_row + (1 if n else 0), 0, EXTRA_GRID_COLUMNS
+            tk.Checkbutton(
+                extra_section, text="อื่นๆ (พิมพ์เอง):", variable=custom_var, font=("Tahoma", fs(9)),
+                command=lambda: on_extra_toggle("__custom__"),
+            ).grid(row=custom_row, column=custom_col, columnspan=custom_colspan, sticky="w", pady=(fs(4), 0))
+            tk.Entry(
+                extra_section, textvariable=custom_text_var, font=("Tahoma", fs(9)),
+                validate="key", validatecommand=_custom_len_vcmd,
+            ).grid(row=custom_row + 1, column=0, columnspan=EXTRA_GRID_COLUMNS, sticky="ew", padx=(fs(18), 0))
 
         def on_mode_change(*args):
             mode_var.set(mode_label_to_key[mode_display_var.get()])
@@ -1862,6 +2026,7 @@ class LabelApp:
                 messagebox.showwarning("แจ้งเตือน", "กรุณาใส่ชื่อยา", parent=win)
                 return False
             d["drug1"] = drug1_var.get().strip()
+            d["barcode"] = barcode_var.get().strip()
             d["drug2"] = drug2_var.get().strip()
             d["note"] = note_var.get().strip()
             d["qty"] = qty_var.get().strip()
@@ -1870,7 +2035,7 @@ class LabelApp:
             d["every_hr"] = every_hr_var.get().strip() if every_hr_enabled_var.get() else ""
             d["meal"] = meal_var.get().strip()
             d["times"] = [t for t, v in time_vars.items() if v.get()]
-            d["extra_labels"] = [opt for opt, v in extra_vars.items() if v.get()]
+            d["extra_labels"] = collect_extra_labels()
             d["usage_mode"] = mode_var.get()
             # unit/meal are only meaningful for the field/mode combos that
             # actually show them - normalize the rest so stored data doesn't
@@ -2233,6 +2398,55 @@ class LabelApp:
             win.destroy()
             self.status_var.set(f"โหลดรายการซ้ำแล้ว ({len(job['drugs'])} รายการยา)")
 
+        def show_patient_alert_popup(patient_id):
+            """Surfaces allergy info the moment a returning customer is
+            picked - the whole point of linking to a patient profile is
+            useless if the pharmacist still has to go dig for it manually
+            in a separate dialog before dispensing."""
+            try:
+                patient = storage.get_patient(patient_id)
+            except Exception:
+                patient = None
+            if not patient:
+                return
+            popup = tk.Toplevel(win)
+            popup.title("ประวัติผู้ป่วย - ตรวจสอบก่อนจ่ายยา")
+            popup.transient(win)
+            popup.grab_set()
+
+            hn_part = f"  [HN {patient['hn_code']}]" if patient.get("hn_code") else ""
+            tk.Label(
+                popup, text=patient["name"] + hn_part, font=("Tahoma", fs(13), "bold"),
+            ).pack(anchor="w", padx=fs(14), pady=(fs(12), fs(4)))
+
+            tk.Label(popup, text="ประวัติแพ้ยา", font=("Tahoma", fs(10), "bold")).pack(anchor="w", padx=fs(14))
+            allergy_note = (patient.get("allergy_note") or "").strip()
+            if allergy_note:
+                tk.Label(
+                    popup, text=allergy_note, font=("Tahoma", fs(11), "bold"), fg="#b03a2e",
+                    wraplength=fs(360), justify="left",
+                ).pack(anchor="w", padx=fs(14), pady=(fs(2), fs(10)))
+            else:
+                tk.Label(
+                    popup, text="ไม่มีประวัติแพ้ยาบันทึกไว้", font=("Tahoma", fs(10)), fg="#666",
+                ).pack(anchor="w", padx=fs(14), pady=(fs(2), fs(10)))
+
+            def open_full_profile():
+                popup.destroy()
+                win.grab_release()  # avoid competing with the new dialog's own grab
+                self.open_patient_profile_dialog(preload_patient_id=patient_id)
+
+            btn_row = tk.Frame(popup)
+            btn_row.pack(pady=(0, fs(12)))
+            tk.Button(
+                btn_row, text="📁 เปิดประวัติผู้ป่วยเต็ม", font=("Tahoma", fs(9), "bold"),
+                bg="#1a5a9a", fg="white", command=open_full_profile,
+            ).pack(side="left", padx=fs(4))
+            tk.Button(btn_row, text="ปิด", font=("Tahoma", fs(9)), command=popup.destroy).pack(side="left", padx=fs(4))
+
+            popup.lift()
+            popup.focus_force()
+
         def pick_name():
             sel = job_list.curselection()
             if not sel:
@@ -2251,6 +2465,8 @@ class LabelApp:
             self._queue_patient_id = job.get("patient_id") or storage.find_patient_id(name, phone)
             self.selected_customer_var.set("ลค: " + name + (f" ({phone})" if phone else ""))
             self.status_var.set(f"เลือกชื่อลูกค้า '{name}' แล้ว - จะใส่ให้อัตโนมัติตอนกดยืนยันพิมพ์")
+            if self._queue_patient_id:
+                show_patient_alert_popup(self._queue_patient_id)
 
         def toggle_hidden():
             sel = job_list.curselection()
@@ -2313,7 +2529,7 @@ class LabelApp:
 
     # ---------------------------------------------------------------- patient profile
 
-    def open_patient_profile_dialog(self):
+    def open_patient_profile_dialog(self, preload_patient_id=None):
         win = tk.Toplevel(self.root)
         win.title("ประวัติผู้ป่วย")
         win_w = fs(520)
@@ -2533,6 +2749,9 @@ class LabelApp:
         result_list.bind("<<ListboxSelect>>", on_result_select)
         search_entry.bind("<Return>", lambda e: do_search())
 
+        if preload_patient_id:
+            load_patient(preload_patient_id)
+
         win.lift()
         win.focus_force()
         search_entry.focus_set()
@@ -2665,6 +2884,108 @@ class LabelApp:
         refresh()
         win.lift()
         win.focus_force()
+
+    def open_ai_assist_dialog(self):
+        """Phase 1 of an "AI ช่วยค้นข้อมูล" helper - free-text only (อาการ/
+        อายุ/เพศ typed in by the pharmacist), nothing sourced from or linked
+        to any patient record in this app (no name, no phone, no document/
+        photo upload - deliberately, to keep this a general lookup tool and
+        not a channel for real patient data). Reference-only: never treat
+        the reply as a diagnosis - that's why the disclaimer is pinned at
+        the top, not buried in a tooltip somewhere."""
+        settings = app_settings.load_settings()
+        configured = [k for k in ai_assist.PROVIDERS if settings.get(ai_assist.PROVIDERS[k]["key_field"])]
+
+        win = tk.Toplevel(self.root)
+        win.title("AI ช่วยค้นข้อมูล")
+        win.geometry(f"{fs(520)}x{fs(600)}")
+        win.transient(self.root)
+        win.grab_set()
+
+        tk.Label(
+            win, text="⚠ คำตอบจาก AI เป็นข้อมูลอ้างอิงประกอบการตัดสินใจเท่านั้น ไม่ใช่คำวินิจฉัยทางการแพทย์ "
+                       "- เภสัชกรต้องใช้วิจารณญาณตัดสินใจเองเสมอ ห้ามพิมพ์ชื่อหรือข้อมูลส่วนตัวของผู้ป่วยลงในนี้",
+            font=("Tahoma", fs(9), "bold"), fg="#a00", wraplength=fs(490), justify="left",
+        ).pack(anchor="w", padx=fs(10), pady=(fs(10), fs(6)))
+
+        if not configured:
+            tk.Label(
+                win, text="ยังไม่ได้ตั้งค่า API Key เลย - ไปที่ปุ่ม ⚙️ ตั้งค่า เพื่อใส่ API Key ของ ChatGPT/Claude/Grok "
+                           "อย่างน้อย 1 ตัวก่อนใช้งานฟีเจอร์นี้",
+                font=("Tahoma", fs(10), "bold"), fg="#a00", wraplength=fs(490), justify="left",
+            ).pack(anchor="w", padx=fs(10), pady=(0, fs(10)))
+            tk.Button(win, text="ปิด", font=("Tahoma", fs(10)), command=win.destroy).pack(pady=fs(10))
+            win.lift()
+            win.focus_force()
+            return
+
+        provider_row = tk.Frame(win)
+        provider_row.pack(fill="x", padx=fs(10), pady=(0, fs(6)))
+        tk.Label(provider_row, text="ผู้ให้บริการ AI:", font=("Tahoma", fs(10), "bold")).pack(side="left")
+        provider_labels = [ai_assist.PROVIDERS[k]["label"] for k in configured]
+        provider_display_var = tk.StringVar(value=provider_labels[0])
+        provider_combo = ttk.Combobox(
+            provider_row, textvariable=provider_display_var, values=provider_labels,
+            state="readonly", font=("Tahoma", fs(10)),
+        )
+        provider_combo.pack(side="left", padx=(fs(6), 0), fill="x", expand=True)
+        label_to_key = {ai_assist.PROVIDERS[k]["label"]: k for k in configured}
+
+        tk.Label(
+            win, text="พิมพ์อาการ/อายุ/เพศ (ห้ามใส่ชื่อหรือข้อมูลที่ระบุตัวตนได้)",
+            font=("Tahoma", fs(10), "bold"),
+        ).pack(anchor="w", padx=fs(10))
+        prompt_text = tk.Text(win, font=("Tahoma", fs(11)), height=6, bd=1, relief="solid", wrap="word")
+        prompt_text.pack(fill="x", padx=fs(10), pady=(fs(2), fs(6)))
+
+        status_var = tk.StringVar(value="")
+        tk.Label(win, textvariable=status_var, font=("Tahoma", fs(9)), fg="#666").pack(anchor="w", padx=fs(10))
+
+        # Packed here (right after the prompt box) rather than at the very
+        # end - a tall response Text with expand=True would otherwise push
+        # this button below the bottom of the window on shorter screens,
+        # same overflow problem seen earlier with the edit-drug dialog.
+        send_btn = tk.Button(
+            win, text="📤 ส่ง", font=("Tahoma", fs(10), "bold"), bg="#1a5a9a", fg="white", command=lambda: do_send(),
+        )
+        send_btn.pack(pady=(fs(2), fs(8)))
+
+        tk.Label(win, text="คำตอบ", font=("Tahoma", fs(10), "bold")).pack(anchor="w", padx=fs(10), pady=(fs(4), 0))
+        response_text = tk.Text(win, font=("Tahoma", fs(10)), bd=1, relief="solid", wrap="word", state="disabled")
+        response_text.pack(fill="both", expand=True, padx=fs(10), pady=(fs(2), fs(8)))
+
+        def set_response(text):
+            response_text.config(state="normal")
+            response_text.delete("1.0", tk.END)
+            response_text.insert("1.0", text)
+            response_text.config(state="disabled")
+
+        def do_send():
+            prompt = prompt_text.get("1.0", tk.END).strip()
+            if not prompt:
+                status_var.set("กรุณาพิมพ์อาการก่อน")
+                return
+            provider_key = label_to_key.get(provider_display_var.get())
+            if not provider_key:
+                return
+            provider_info = ai_assist.PROVIDERS[provider_key]
+            api_key = settings.get(provider_info["key_field"], "")
+            send_btn.config(state="disabled")
+            status_var.set(f"กำลังส่งไปที่ {provider_info['label']}...")
+
+            def worker():
+                success, text = provider_info["call"](api_key, prompt)
+                def apply():
+                    send_btn.config(state="normal")
+                    status_var.set("" if success else "เกิดข้อผิดพลาด")
+                    set_response(text)
+                self.root.after(0, apply)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        win.lift()
+        win.focus_force()
+        prompt_text.focus_set()
 
     # ---------------------------------------------------------------- confirm + print
 
@@ -2937,7 +3258,7 @@ class LabelApp:
                                bg="#1a7a4a", fg="white", command=do_print)
         print_btn.pack(side="left", padx=fs(4))
         history_btn = tk.Button(
-            btn_row2, text="📋 บันทึกประวัติ (ไม่พิมพ์)", font=("Tahoma", fs(9)),
+            btn_row2, text="📋 บันทึกประวัติฉลาก (ไม่พิมพ์)", font=("Tahoma", fs(9)),
             command=save_history_only,
         )
         history_btn.pack(side="left", padx=fs(4))

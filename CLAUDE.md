@@ -75,6 +75,133 @@ per-conversation).
 `APP_VERSION` in `label_gui.py` (shown in the window title bar) — bump it whenever a commit ships
 a user-visible feature/fix batch, since there's no other version indicator in this app.
 
+- **1.11.0** — Main window now starts maximized (`root.state("zoomed")`, right after the existing
+  `root.geometry()` call which stays as the fallback size if the window is later un-maximized) - the
+  toolbar row (search label + 6 buttons: AI ช่วยค้นข้อมูล/ประวัติผู้ป่วย/แฟ้มประวัติการจ่ายยา/คิวจาก
+  มือถือ/Import จาก Excel/ตั้งค่า) had grown too wide for the old default `1050x700` window to show
+  every button without clipping. MobileQueue-only change (HOPE's main window is unaffected).
+- **1.10.0** — Phase 1 of "🤖 AI ช่วยค้นข้อมูล": a popup where the pharmacist types symptoms/age/
+  gender and gets a reply from a provider of their choice (ChatGPT/Claude/Grok), pinned behind a
+  bold red disclaimer that it's reference-only, never a diagnosis. New `ai_assist.py` module - thin
+  `requests`-based REST clients (`call_openai`/`call_anthropic`/`call_xai`), no provider SDKs (would
+  bloat the PyInstaller build for 3 near-identical JSON-in/JSON-out calls). API keys are per-provider
+  fields in the existing local `settings.json` (`openai_api_key`/`anthropic_api_key`/`xai_api_key`,
+  masked `Entry` widgets in the settings dialog) - never hardcoded, never required (the dialog only
+  offers providers that actually have a key set; shows a setup prompt instead if none do).
+  **Deliberately scoped down from the original ask**: no image/photo upload, and the popup is
+  completely disconnected from this app's own patient database (no name, no phone, no
+  auto-fill-from-a-record) - typed free text only. This was forced by Claude Code's own auto-mode
+  safety classifier, which hard-blocked the first version (which did include photo upload) as a
+  data-exfiltration risk the moment it saw "symptom + photo → third-party AI API" in the same
+  module - patient health data leaving the app to an unlisted external destination isn't something
+  that gets waved through by a user's in-chat approval, by design. The user confirmed no personal/
+  identifying data is ever typed into it in practice, and this text-only version passed on retry.
+  Photo upload (and hooking it up to the patient DB) is now explicitly phase 2, not phase 1 - if
+  revisited, expect the same classifier to gate it again unless the destination/data flow is
+  narrowed further first. Verified via scripted Tkinter tests with the actual network call
+  monkeypatched (both the "no key configured" empty state and a real send-and-display round trip) -
+  **could not test an actual live call to any of the 3 providers** (no API key available in this
+  session) - only confirmed the exe builds/bundles `requests`+`certifi` correctly (via PyInstaller's
+  built-in hook, memory footprint increased ~25MB as expected) and launches without error.
+  Follow-up same day: the "ส่ง" button was packed *after* the response `Text` (which has
+  `expand=True`), so on shorter screens it got pushed below the visible window - same overflow class
+  of bug as the edit-drug dialog earlier. Fixed by moving the button's creation/pack call to right
+  after the prompt box, before the response label/box, so it's always visible regardless of window
+  height. Verified via pack-order introspection (not just visually) that the button now sits before
+  the response `Text` in the widget tree.
+- **1.9.0** — Barcode scanner support. New `drug_templates.barcode` column (nullable, indexed, no
+  uniqueness constraint - real-world data occasionally has a shared/reused code). Key insight: a
+  barcode scanner is just a fast keyboard that types the code then sends Enter - no special hardware
+  handling needed, one search box covers both typed names and scans. `search_templates()` now
+  matches barcode too, and the main search `Entry` (previously anonymous, now captured as
+  `search_entry` to bind `<Return>`) calls new `on_search_enter()`: if the typed/scanned text is an
+  *exact* barcode match (ambiguous = 2+ matches counts as no match, per `find_template_by_barcode()`)
+  it adds the drug straight to the print queue and clears the box, skipping the usual
+  double-click-a-result step. Edit-drug dialog gains a "บาร์โค้ด" `Entry` - originally its own
+  full-width row under ชื่อการค้า, but that overflowed the dialog (same problem as the ฉลากเสริม grid
+  earlier) so it now sits inline to the right of the name `Entry` instead, narrow (`width=14`, ~1/3
+  the name field) with just a compact "บาร์โค้ด:" label, saving a full row - wired
+  through `collect_into_d()`/`upsert_template()`/`get_template()`. Excel import consolidated onto
+  one unified path, `read_excel_drug_names_and_barcodes()` + `storage.bulk_import_names_and_barcodes()`
+  (the old name-only `read_excel_drug_names()`/`bulk_import_names()` were deleted as dead code once
+  nothing called them) - handles two cases with the same logic since they're really the same
+  operation: a brand-new name creates a blank template with the barcode set, but a name that
+  **already exists updates ONLY the barcode column**, never touching dosing info a pharmacist
+  already filled in. This was the specific scenario that drove the design - a shop that already
+  imported names and hand-edited dosing for many drugs needed a way to backfill barcodes afterward
+  without any risk of clobbering that work. The barcode column is intentionally absent from
+  "Copy จากยาอื่น/ไปยาอื่น" (barcode identifies a physical product, not a dosing config - same
+  category as drug1, which was already excluded). Verified via direct `storage.*` calls (existing
+  dosing survives a barcode-only update, a new name creates correctly, exact-vs-ambiguous barcode
+  lookup) and scripted Tkinter widget tests (scan-to-add clears the box and adds the right drug,
+  unknown code does nothing, the edit-dialog field round-trips through save). **Ported to HOPE with
+  one deliberate difference** (see below) - no Excel import there.
+- **1.8.0** — "บันทึกประวัติ (ไม่พิมพ์)" button renamed to "บันทึกประวัติฉลาก (ไม่พิมพ์)" (both here and
+  HOPE) to be explicit that it only writes to the print-history log, not to the patient profile -
+  came up after a user question about which of the two ("แฟ้มประวัติการจ่ายยา" vs "ประวัติผู้ป่วย") it
+  actually touches, since there's no phone field visible in this dialog (that only lives inside the
+  separate "บันทึกลงแฟ้มผู้ป่วย" popup). Also: picking a returning customer via "เลือกชื่อลูกค้า" now
+  pops up an allergy-check alert (`show_patient_alert_popup()`, in `open_print_history_dialog`'s
+  `pick_name()`) whenever `_queue_patient_id` resolves to a real patient profile - shows name, HN,
+  and the allergy note in bold red, or an explicit "ไม่มีประวัติแพ้ยาบันทึกไว้" if none is recorded
+  (deliberately not silent either way - silence would be indistinguishable from "checked, no
+  allergy"). A "📁 เปิดประวัติผู้ป่วยเต็ม" button jumps straight into the full profile dialog
+  pre-loaded to that patient (`open_patient_profile_dialog(preload_patient_id=...)`, new optional
+  param that calls the dialog's own `load_patient()` right before `win.lift()`) - releases the
+  print-history dialog's `grab_set()` first so it doesn't compete with the new dialog's grab. No
+  popup at all for a walk-in with no matching profile (`patient_id` stays `None`). Verified via the
+  same synchronous-thread Tkinter-driving pattern: real patient with an allergy note shows the
+  correct red text, a patient with no allergy note shows the explicit "none recorded" message, and a
+  profile-less walk-in triggers zero popups - all three cases confirmed by inspecting the actual
+  widget tree, not just the underlying data. **Ported identically to HOPE**, re-verified there too
+  against real SQL Server with a `__TEST_ALLERGY__` throwaway patient (cleaned up, zero rows left).
+- **1.7.0** — Favorites can now hold a per-drug dosing override that differs from that drug's global
+  DB default, instead of always getting silently overwritten on every load. `on_save_favorite()`
+  snapshots each drug's current `status`: anything showing orange ("edited" - changed this session,
+  never pushed to the DB template) gets `entry["override"] = True` frozen into the favorite;
+  anything green/red (`"db"`/`"missing"`) gets `False`, since there's nothing custom to protect.
+  `on_load_favorite()` now checks this flag first - an override entry skips the
+  `get_product_med_info()` refresh entirely and keeps the favorite's own saved dosing, showing a new
+  **4th status color, yellow (`#b8960c`, ★ mark, status `"override"`)** - distinct from orange, since
+  orange means "will be lost if not saved somewhere" while yellow means "deliberately preserved
+  inside this favorite." Non-override entries are untouched - still auto-refresh from the DB every
+  load like before, so a drug that gets real dosing data added later still turns green immediately.
+  Verified end-to-end (not just the collection logic) via a synchronous-threading test harness that
+  calls the real `on_save_favorite`/`on_load_favorite` methods against a scratch SQLite DB: an
+  unmodified drug correctly re-synced to the DB's values, while an edited one kept its custom
+  per_day/note/meal through a save+reload cycle. **Ported identically to HOPE** (same test pattern,
+  run against real SQL Server with a `999999901` throwaway idproduct + `__TEST_FAV__` favorite name,
+  both cleaned up immediately after - verified zero rows remaining post-cleanup).
+- **1.6.0** — "ฉลากเสริม" checkbox grid in the edit-drug dialog gains a free-text 12th-ish option:
+  "อื่นๆ (พิมพ์เอง)" - a checkbox + `Entry` pair, capped at `MAX_CUSTOM_EXTRA_LABEL_CHARS = 30`
+  (enforced live via a `validate="key"` command, not just on save) so it can never need the label
+  renderer's `fit_font()` to shrink it below a comfortable size standing alone. Counts toward the
+  same `MAX_EXTRA_LABELS = 2` cap as the presets (`checked_extra_count()`/`on_extra_toggle()` now
+  handle both preset checkboxes and the custom one uniformly). The checkbox+`Entry` widgets get
+  torn down and rebuilt on every usage-mode switch (same as the preset grid), but the underlying
+  `custom_var`/`custom_text_var` are created once outside `render_extra_fields()` so typed text
+  survives switching ยากิน/ยาทา/ยาหยอด instead of getting wiped. Existing non-preset strings in a
+  saved drug's `extra_labels` are recognized as "the custom one" on dialog open
+  (`_init_custom_from_d()`, checked against the union of every mode's presets) and round-trip
+  correctly through "Copy จากยาอื่น" too. Verified via a scripted Tkinter test that drives the real
+  widgets (invoke/insert/mode-switch) rather than just unit-testing the collection logic - confirmed
+  live per-keystroke truncation at exactly 30 chars, mode-switch persistence, and correct rejection
+  when a 3rd item would exceed the cap. **Ported identically to the HOPE build in the same session.**
+  Follow-up same day: ยากิน's 7 presets (odd count) pushed the custom row + entry below the visible
+  dialog, cutting off the save buttons. Fixed by tucking the custom checkbox into the empty
+  right-hand grid cell of the last preset row when the count is odd (ยากิน 7, ยาหยอด 3), instead of
+  always starting a fresh row - saves exactly one row's height. ยาทา's 2 presets fill their row
+  exactly (even count) so it's unaffected, same as before. Verified via `grid_info()` on the actual
+  widgets across all 3 modes (not just visually) - confirmed the custom checkbox lands in the right
+  cell and the last preset checkbox isn't overlapped.
+  Second follow-up same day: the 1-row-saved fix still wasn't enough - save buttons were still
+  getting pushed off-screen. Switched approach entirely: dialog widened from `fs(440)` to `fs(590)`
+  (`440 * 4/3`) and the "ฉลากเสริม" grid changed from 2 to 3 columns (`EXTRA_GRID_COLUMNS = 3`,
+  `wraplength` tightened from `fs(180)` to `fs(150)` per checkbox to fit the narrower columns). The
+  odd/even gap-filling logic for the custom checkbox generalized to any column count via
+  `last_row_count = n - last_row * EXTRA_GRID_COLUMNS` - now ยาทา (2 presets) also benefits, fitting
+  entirely on one row including the custom checkbox, not just ยากิน/ยาหยอด. Verified via
+  `grid_info()` across all 3 modes again after the column-count change.
 - **1.5.0** — A4 sheet printing, for shops without a thermal label printer. New "ประเภทกระดาษ" dropdown
   in settings (`app_settings.DEFAULTS["paper_mode"]`, `"thermal"` default or `"a4"`). When `"a4"`,
   `do_print`'s worker builds every physical label image first (print_qty duplicates included, all

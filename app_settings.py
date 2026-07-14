@@ -18,6 +18,9 @@ DEFAULTS = {
     "address_line2": "",
     "phone": "",
     "pharmacist_names": "",
+    "openai_api_key": "",
+    "anthropic_api_key": "",
+    "xai_api_key": "",
 }
 
 
