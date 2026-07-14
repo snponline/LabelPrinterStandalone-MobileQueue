@@ -3,6 +3,7 @@ POS integration needed. Each installation keeps its own drug list."""
 import io
 import json
 import os
+import shutil
 import sqlite3
 import uuid
 from datetime import datetime, timedelta
@@ -74,10 +75,19 @@ def _connect():
     # can coexist without interfering with each other.
     if "archived" not in existing_job_cols:
         conn.execute("ALTER TABLE print_jobs ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
+    # patient_id links a print job to a real patients-table record - only
+    # ever set when one unambiguously exists (saved-to-patient-file at print
+    # time, or picked from an existing profile) - see find_patient_id().
+    # Deliberately nullable: most prints never touch the patients table at
+    # all, and older rows from before this column existed have no way to
+    # backfill it except a best-effort one-time script.
+    if "patient_id" not in existing_job_cols:
+        conn.execute("ALTER TABLE print_jobs ADD COLUMN patient_id INTEGER")
     # indexes for search-by-patient to stay fast even after years of history
     conn.execute("CREATE INDEX IF NOT EXISTS idx_print_jobs_patient ON print_jobs(patient_name)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_print_jobs_phone ON print_jobs(customer_phone)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_print_jobs_printed_at ON print_jobs(printed_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_print_jobs_patient_id ON print_jobs(patient_id)")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS print_job_items (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -97,8 +107,17 @@ def _connect():
             created_at TEXT NOT NULL
         )
     """)
+    # hn_code (YYYY-NNNNN, 5-digit running number reset per year) is a
+    # customer-facing id for a planned future "online card" feature -
+    # deliberately separate from the internal autoincrement `id` (which
+    # stays a plain surrogate key for FK/index purposes) so its format can
+    # change independently later without touching anything it's linked to.
+    existing_patient_cols = {row[1] for row in conn.execute("PRAGMA table_info(patients)")}
+    if "hn_code" not in existing_patient_cols:
+        conn.execute("ALTER TABLE patients ADD COLUMN hn_code TEXT")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_patients_name ON patients(name)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_patients_phone ON patients(phone)")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_patients_hn_code ON patients(hn_code)")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS patient_documents (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -413,17 +432,20 @@ def delete_staff_name(staff_id):
 # separate file; indexes on patient_name/customer_phone/printed_at keep
 # search fast as it grows.
 
-def add_print_job(patient_name, customer_phone, drugs):
+def add_print_job(patient_name, customer_phone, drugs, patient_id=None):
     """`drugs` is the same list of dicts already used everywhere else in this
     app (selected_drugs) - idproduct, drug1, drug2, note, qty, unit, per_day,
     every_hr, meal, times, extra_labels, usage_mode, print_qty. patient_name
-    and customer_phone are both optional (blank string if not given)."""
+    and customer_phone are both optional (blank string if not given).
+    patient_id is only ever passed when a real patients-table record
+    unambiguously exists for this print (see find_or_create_patient/
+    find_patient_id) - most prints leave it None."""
     conn = _connect()
     try:
         cur = conn.cursor()
         cur.execute(
-            "INSERT INTO print_jobs (patient_name, customer_phone, printed_at) VALUES (?, ?, ?)",
-            (patient_name or "", customer_phone or "", datetime.now().isoformat()),
+            "INSERT INTO print_jobs (patient_name, customer_phone, printed_at, patient_id) VALUES (?, ?, ?, ?)",
+            (patient_name or "", customer_phone or "", datetime.now().isoformat(), patient_id),
         )
         job_id = cur.lastrowid
         for d in drugs:
@@ -451,7 +473,7 @@ def add_print_job(patient_name, customer_phone, drugs):
 
 def _rows_to_jobs(conn, job_rows):
     jobs = []
-    for job_id, patient_name, customer_phone, printed_at, hidden, archived in job_rows:
+    for job_id, patient_name, customer_phone, printed_at, hidden, archived, patient_id in job_rows:
         item_rows = conn.execute(
             """
             SELECT idproduct, drug1, drug2, note, qty, unit, per_day, every_hr, meal,
@@ -473,7 +495,8 @@ def _rows_to_jobs(conn, job_rows):
             })
         jobs.append({
             "id": job_id, "patient_name": patient_name or "", "customer_phone": customer_phone or "",
-            "printed_at": printed_at, "hidden": bool(hidden), "archived": bool(archived), "drugs": drugs,
+            "printed_at": printed_at, "hidden": bool(hidden), "archived": bool(archived),
+            "patient_id": patient_id, "drugs": drugs,
         })
     return jobs
 
@@ -487,13 +510,14 @@ def list_print_jobs(hours=24):
     try:
         if hours is None:
             job_rows = conn.execute(
-                "SELECT id, patient_name, customer_phone, printed_at, hidden, archived FROM print_jobs ORDER BY printed_at DESC"
+                "SELECT id, patient_name, customer_phone, printed_at, hidden, archived, patient_id "
+                "FROM print_jobs ORDER BY printed_at DESC"
             ).fetchall()
         else:
             cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
             job_rows = conn.execute(
-                "SELECT id, patient_name, customer_phone, printed_at, hidden, archived FROM print_jobs "
-                "WHERE printed_at >= ? ORDER BY printed_at DESC",
+                "SELECT id, patient_name, customer_phone, printed_at, hidden, archived, patient_id "
+                "FROM print_jobs WHERE printed_at >= ? ORDER BY printed_at DESC",
                 (cutoff,),
             ).fetchall()
         return _rows_to_jobs(conn, job_rows)
@@ -510,7 +534,7 @@ def search_print_jobs(term, limit=200):
         like = f"%{term}%"
         job_rows = conn.execute(
             """
-            SELECT id, patient_name, customer_phone, printed_at, hidden, archived FROM print_jobs
+            SELECT id, patient_name, customer_phone, printed_at, hidden, archived, patient_id FROM print_jobs
             WHERE patient_name LIKE ? OR customer_phone LIKE ?
             ORDER BY printed_at DESC LIMIT ?
             """,
@@ -521,14 +545,20 @@ def search_print_jobs(term, limit=200):
         conn.close()
 
 
-def list_print_jobs_for_patient(name, phone, limit=500):
-    """Exact match on name and/or phone (not substring like search_print_jobs)
-    - for a patient profile view where we already know their exact recorded
-    name/phone and want precisely their history, not a fuzzy search."""
+def list_print_jobs_for_patient(name, phone, patient_id=None, limit=500):
+    """Exact match, for a patient profile view where we already know exactly
+    who we're looking at and want precisely their history, not a fuzzy
+    search. Prefers patient_id (unambiguous) when given, but still ORs in
+    the legacy name/phone match so history recorded before patient_id
+    existed - or from a print that was never linked to a saved profile -
+    keeps showing up."""
     conn = _connect()
     try:
         conditions = []
         params = []
+        if patient_id:
+            conditions.append("patient_id = ?")
+            params.append(patient_id)
         if name:
             conditions.append("patient_name = ?")
             params.append(name)
@@ -539,7 +569,7 @@ def list_print_jobs_for_patient(name, phone, limit=500):
             return []
         where = " OR ".join(conditions)
         job_rows = conn.execute(
-            f"SELECT id, patient_name, customer_phone, printed_at, hidden, archived FROM print_jobs "
+            f"SELECT id, patient_name, customer_phone, printed_at, hidden, archived, patient_id FROM print_jobs "
             f"WHERE {where} ORDER BY printed_at DESC LIMIT ?",
             (*params, limit),
         ).fetchall()
@@ -622,13 +652,86 @@ def get_patient(patient_id):
     conn = _connect()
     try:
         row = conn.execute(
-            "SELECT id, name, phone, allergy_note FROM patients WHERE id = ?", (patient_id,)
+            "SELECT id, name, phone, allergy_note, hn_code FROM patients WHERE id = ?", (patient_id,)
         ).fetchone()
         if not row:
             return None
-        return {"id": row[0], "name": row[1], "phone": row[2] or "", "allergy_note": row[3] or ""}
+        return {"id": row[0], "name": row[1], "phone": row[2] or "", "allergy_note": row[3] or "", "hn_code": row[4] or ""}
     finally:
         conn.close()
+
+
+def list_all_patients(order_by="name"):
+    """Every patient record, for the "HN ทั้งหมด" management list - not
+    filtered by search term like search_patients(). order_by is whitelisted
+    (never interpolate a caller-supplied column name into SQL)."""
+    column = "hn_code" if order_by == "hn_code" else "name"
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            f"SELECT id, name, phone, allergy_note, hn_code FROM patients ORDER BY {column}"
+        ).fetchall()
+        return [
+            {"id": r[0], "name": r[1], "phone": r[2] or "", "allergy_note": r[3] or "", "hn_code": r[4] or ""}
+            for r in rows
+        ]
+    finally:
+        conn.close()
+
+
+def delete_patient(patient_id):
+    """Removes the patient record, their uploaded documents (files + rows),
+    and unlinks (not deletes) any print_jobs that pointed at this patient_id
+    - the print history itself (name/phone/drugs snapshot) is left intact,
+    only the FK link is cleared, same principle as archiving vs. deleting a
+    print job elsewhere in this app."""
+    patient_dir = os.path.join(PATIENT_DOCS_DIR, str(patient_id))
+    if os.path.isdir(patient_dir):
+        shutil.rmtree(patient_dir, ignore_errors=True)
+    conn = _connect()
+    try:
+        conn.execute("DELETE FROM patient_documents WHERE patient_id = ?", (patient_id,))
+        conn.execute("UPDATE print_jobs SET patient_id = NULL WHERE patient_id = ?", (patient_id,))
+        conn.execute("DELETE FROM patients WHERE id = ?", (patient_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def delete_all_patients():
+    """Wipes every patient record, all their documents, and unlinks every
+    print_jobs.patient_id - for a store that just started using patient
+    profiles and wants to reset (e.g. test/dummy entries from trying the
+    feature out). Print history text (names/phones/drugs) is untouched;
+    only the patients table and its FK links are cleared. hn_code numbering
+    naturally restarts at 00001 next time a patient is created, since
+    _generate_hn_code() looks at what's actually in the (now empty) table."""
+    if os.path.isdir(PATIENT_DOCS_DIR):
+        shutil.rmtree(PATIENT_DOCS_DIR, ignore_errors=True)
+    conn = _connect()
+    try:
+        conn.execute("DELETE FROM patient_documents")
+        conn.execute("UPDATE print_jobs SET patient_id = NULL")
+        conn.execute("DELETE FROM patients")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _generate_hn_code(conn, year=None):
+    """YYYY-NNNNN, 5-digit running number that resets each year. Computed
+    from the max existing suffix for that year rather than a row COUNT, so a
+    deleted patient record never causes a code to be reused."""
+    year = year or datetime.now().year
+    prefix = f"{year}-"
+    rows = conn.execute("SELECT hn_code FROM patients WHERE hn_code LIKE ?", (prefix + "%",)).fetchall()
+    max_n = 0
+    for (code,) in rows:
+        try:
+            max_n = max(max_n, int(code.split("-", 1)[1]))
+        except (ValueError, IndexError, AttributeError):
+            continue
+    return f"{prefix}{max_n + 1:05d}"
 
 
 def find_or_create_patient(name, phone):
@@ -647,12 +750,82 @@ def find_or_create_patient(name, phone):
         ).fetchone()
         if row:
             return row[0]
+        hn_code = _generate_hn_code(conn)
         cur.execute(
-            "INSERT INTO patients (name, phone, allergy_note, created_at) VALUES (?, ?, '', ?)",
-            (name, phone, datetime.now().isoformat()),
+            "INSERT INTO patients (name, phone, allergy_note, created_at, hn_code) VALUES (?, ?, '', ?, ?)",
+            (name, phone, datetime.now().isoformat(), hn_code),
         )
         conn.commit()
         return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def find_patient_id(name, phone):
+    """Like find_or_create_patient's lookup half, but never creates - for
+    linking a print job to a patient record only when one unambiguously
+    already exists (e.g. picking a name from print history), so reprinting
+    an old anonymous/unsaved label never spawns a junk patient profile."""
+    name = (name or "").strip()
+    phone = (phone or "").strip()
+    if not name and not phone:
+        return None
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT id FROM patients WHERE name = ? AND IFNULL(phone, '') = ?", (name, phone)
+        ).fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def backfill_patient_hn_codes():
+    """One-time (but safe to re-run - only touches rows still missing a
+    code): assigns hn_code to patients created before this column existed.
+    Processed oldest-first so earlier customers get the lower running
+    numbers within their creation year, same as if they'd gotten a code the
+    day they were first added."""
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT id, created_at FROM patients WHERE hn_code IS NULL ORDER BY created_at ASC"
+        ).fetchall()
+        for patient_id, created_at in rows:
+            try:
+                year = datetime.fromisoformat(created_at).year
+            except (ValueError, TypeError):
+                year = datetime.now().year
+            code = _generate_hn_code(conn, year=year)
+            conn.execute("UPDATE patients SET hn_code = ? WHERE id = ?", (code, patient_id))
+            conn.commit()  # commit per-row so the next _generate_hn_code call sees this one
+        return len(rows)
+    finally:
+        conn.close()
+
+
+def backfill_print_job_patient_ids():
+    """One-time (safe to re-run): for print_jobs still missing patient_id,
+    link it up only where (name, phone) matches an existing patients row
+    exactly - never creates a new patient record, and silently skips rows
+    that don't match anything (most won't, since most prints are never
+    saved to a patient file). Returns (linked_count, checked_count)."""
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT id, patient_name, customer_phone FROM print_jobs WHERE patient_id IS NULL"
+        ).fetchall()
+        linked = 0
+        for job_id, name, phone in rows:
+            match = conn.execute(
+                "SELECT id FROM patients WHERE name = ? AND IFNULL(phone, '') = ?",
+                (name or "", phone or ""),
+            ).fetchone()
+            if match:
+                conn.execute("UPDATE print_jobs SET patient_id = ? WHERE id = ?", (match[0], job_id))
+                linked += 1
+        conn.commit()
+        return linked, len(rows)
     finally:
         conn.close()
 

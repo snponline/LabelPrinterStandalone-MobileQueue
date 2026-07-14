@@ -12,6 +12,7 @@ DEFAULTS = {
     "printer_name": "",
     "label_w_mm": 80,
     "label_h_mm": 50,
+    "paper_mode": "thermal",  # "thermal" (roll printer, 1 label = 1 page) or "a4" (tiled grid on A4)
     "company_name": "",
     "address_line1": "",
     "address_line2": "",

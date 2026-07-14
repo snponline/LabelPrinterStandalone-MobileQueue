@@ -49,7 +49,7 @@ def save_favorites(favorites):
         json.dump(favorites, f, ensure_ascii=False, indent=2)
 
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.5.0"
 
 DOTS_PER_MM = 8  # matches standard 203dpi thermal label printers
 
@@ -467,6 +467,82 @@ def build_label_image(data, settings):
     return img
 
 
+# A4 sheet mode - some shops don't have a thermal label printer, only a
+# regular office printer, and want to print several labels per A4 sheet
+# and cut them apart by hand (or print to "Microsoft Print to PDF", which
+# is just another entry in the printer list - no separate PDF export code
+# needed, the existing print_image() pipeline already handles it since
+# that "printer" is what generates the PDF file).
+A4_W_MM = 210
+A4_H_MM = 297
+A4_MARGIN_MM = 5
+A4_GAP_MM = 3
+A4_COLUMNS = 2
+
+
+A4_DASH_LEN_PX = 10  # ~1.2mm at 8 dots/mm - short dash + gap reads as a perforated cut line
+A4_DASH_GAP_PX = 6
+
+
+def _draw_dashed_rect(draw, box, dash_len=A4_DASH_LEN_PX, gap_len=A4_DASH_GAP_PX, fill=0, width=1):
+    """Perforation-style cut guide (dashes, not a solid line) around one
+    label's edge on the A4 sheet - drawn on the page, not on the label
+    image itself, so it never overlaps the label's own content."""
+    x0, y0, x1, y1 = box
+    step = dash_len + gap_len
+    xx = x0
+    while xx < x1:
+        seg_end = min(xx + dash_len, x1)
+        draw.line([(xx, y0), (seg_end, y0)], fill=fill, width=width)
+        draw.line([(xx, y1), (seg_end, y1)], fill=fill, width=width)
+        xx += step
+    yy = y0
+    while yy < y1:
+        seg_end = min(yy + dash_len, y1)
+        draw.line([(x0, yy), (x0, seg_end)], fill=fill, width=width)
+        draw.line([(x1, yy), (x1, seg_end)], fill=fill, width=width)
+        yy += step
+
+
+def build_a4_pages(label_images):
+    """Tiles same-size label images (already rendered at their configured
+    physical label_w_mm x label_h_mm) into a grid of up to A4_COLUMNS
+    columns per A4 page, as many rows as fit - so each label prints at its
+    real physical size on the sheet, not stretched to fill the page. Falls
+    back to 1 column if the configured label is too wide for 2 side by
+    side. Each label gets a dashed "รอยปรุ" cut guide around its edge so
+    it's obvious where to tear/cut apart by hand. Returns a list of full
+    A4-page PIL images, one per page needed."""
+    if not label_images:
+        return []
+    label_w_px, label_h_px = label_images[0].size
+    margin_px = A4_MARGIN_MM * DOTS_PER_MM
+    gap_px = A4_GAP_MM * DOTS_PER_MM
+    page_w_px = A4_W_MM * DOTS_PER_MM
+    page_h_px = A4_H_MM * DOTS_PER_MM
+
+    usable_w = page_w_px - 2 * margin_px
+    usable_h = page_h_px - 2 * margin_px
+    columns = max(1, min(A4_COLUMNS, (usable_w + gap_px) // (label_w_px + gap_px)))
+    rows_per_page = max(1, (usable_h + gap_px) // (label_h_px + gap_px))
+    per_page = int(columns * rows_per_page)
+
+    pages = []
+    for start in range(0, len(label_images), per_page):
+        chunk = label_images[start:start + per_page]
+        page = Image.new("L", (page_w_px, page_h_px), 255)
+        page_draw = ImageDraw.Draw(page)
+        for i, lbl in enumerate(chunk):
+            col = i % columns
+            row = i // columns
+            px = int(margin_px + col * (label_w_px + gap_px))
+            py = int(margin_px + row * (label_h_px + gap_px))
+            page.paste(lbl, (px, py))
+            _draw_dashed_rect(page_draw, (px, py, px + label_w_px, py + label_h_px))
+        pages.append(page)
+    return pages
+
+
 def print_image(img, printer_name=None):
     import win32print
     import win32ui
@@ -498,7 +574,7 @@ def build_settings_dialog(parent, first_run=False):
     settings = app_settings.load_settings()
     win = tk.Toplevel(parent)
     win.title("ตั้งค่าเริ่มต้น (ครั้งแรก)" if first_run else "ตั้งค่า")
-    win.geometry(f"{fs(440)}x{fs(660)}")
+    win.geometry(f"{fs(440)}x{fs(730)}")
     win.transient(parent)
     win.grab_set()
 
@@ -524,6 +600,21 @@ def build_settings_dialog(parent, first_run=False):
     tk.Label(size_frame, text="สูง", font=("Tahoma", fs(10))).grid(row=0, column=2)
     h_var = tk.StringVar(value=str(settings["label_h_mm"]))
     tk.Entry(size_frame, textvariable=h_var, width=5, font=("Tahoma", fs(10))).grid(row=0, column=3, padx=fs(4))
+
+    tk.Label(win, text="ประเภทกระดาษ", font=("Tahoma", fs(10), "bold")).pack(anchor="w", **pad)
+    PAPER_MODE_LABELS = {"thermal": "ฉลากม้วน (Thermal)", "a4": "A4 (2 คอลัมน์ต่อแผ่น, ตัดแยกเอง)"}
+    PAPER_MODE_KEYS_BY_LABEL = {v: k for k, v in PAPER_MODE_LABELS.items()}
+    paper_mode_var = tk.StringVar(value=PAPER_MODE_LABELS[settings.get("paper_mode", "thermal")])
+    paper_mode_combo = ttk.Combobox(
+        win, textvariable=paper_mode_var, values=list(PAPER_MODE_LABELS.values()),
+        state="readonly", font=("Tahoma", fs(10)),
+    )
+    paper_mode_combo.pack(fill="x", **pad)
+    tk.Label(
+        win, text="A4: เอาไว้เผื่อร้านที่ไม่มีเครื่องพิมพ์สติ๊กเกอร์ - พิมพ์ฉลากขนาดจริง 2 ใบต่อแถวลงกระดาษ "
+                   "A4 แล้วตัดแยกเอง หรือเลือกเครื่องพิมพ์เป็น \"Microsoft Print to PDF\" ด้านบนเพื่อ export เป็น PDF แทนได้เลย",
+        font=("Tahoma", fs(8)), fg="#666", wraplength=fs(400), justify="left",
+    ).pack(anchor="w", padx=fs(10))
 
     tk.Label(win, text="ชื่อร้าน/บริษัท", font=("Tahoma", fs(10), "bold")).pack(anchor="w", **pad)
     name_var = tk.StringVar(value=settings["company_name"])
@@ -563,6 +654,7 @@ def build_settings_dialog(parent, first_run=False):
         app_settings.save_settings({
             "printer_name": printer_var.get().strip(),
             "label_w_mm": w, "label_h_mm": h,
+            "paper_mode": PAPER_MODE_KEYS_BY_LABEL.get(paper_mode_var.get(), "thermal"),
             "company_name": name_var.get().strip(),
             "address_line1": addr1_var.get().strip(),
             "address_line2": addr2_var.get().strip(),
@@ -670,6 +762,9 @@ class LabelApp:
         self._search_after_id = None
         self.favorites = load_favorites()  # name -> list of drug dicts
         self._queue_patient_name = None
+        self._queue_patient_phone = None
+        self._queue_patient_id = None
+        self.NO_CUSTOMER_TEXT = "รอชื่อลูกค้า (optional)"
 
         # Local-LAN server so staff phones on the same WiFi can submit drugs
         # into the print queue - no cloud dependency, matches the "one PC,
@@ -762,6 +857,29 @@ class LabelApp:
         tk.Checkbutton(
             list_header, text="⚠ แพ้ยา", variable=self.allergy_var, font=("Tahoma", fs(9), "bold"), fg="#b03a2e",
         ).pack(side="right", anchor="n", padx=(fs(6), 0))
+
+        # Pick a returning customer straight from the existing "แฟ้มประวัติ
+        # การจ่ายยา" dialog (it already has full search/browsing) instead of
+        # building a separate lookup UI - just adds a "เลือกชื่อนี้" action
+        # in there that carries the name+phone back here. The picked-name
+        # display sits directly under this button so it's obviously tied to it.
+        pick_customer_col = tk.Frame(list_header)
+        pick_customer_col.pack(side="right", anchor="n", padx=(fs(6), 0))
+        tk.Button(
+            pick_customer_col, text="👤 เลือกชื่อลูกค้า", font=("Tahoma", fs(9)),
+            command=lambda: self.open_print_history_dialog(pick_mode=True),
+        ).pack(side="top")
+        customer_row = tk.Frame(pick_customer_col)
+        customer_row.pack(side="top", fill="x")
+        self.selected_customer_var = tk.StringVar(value=self.NO_CUSTOMER_TEXT)
+        tk.Label(
+            customer_row, textvariable=self.selected_customer_var, font=("Tahoma", fs(10), "bold"),
+            fg="#0a3d7a", anchor="w",
+        ).pack(side="left")
+        tk.Button(
+            customer_row, text="✕", font=("Tahoma", fs(7), "bold"), fg="white", bg="#555555", width=2,
+            command=self.clear_selected_customer,
+        ).pack(side="left", padx=(fs(2), 0))
 
         list_container = tk.Frame(left_frame)
         list_container.pack(fill="both", expand=True, padx=fs(10), pady=fs(4))
@@ -1141,6 +1259,12 @@ class LabelApp:
         self.selected_drugs = []
         self.refresh_selected_list()
         self.status_var.set("ล้างรายการยาทั้งหมดแล้ว")
+
+    def clear_selected_customer(self):
+        self.selected_customer_var.set(self.NO_CUSTOMER_TEXT)
+        self._queue_patient_name = None
+        self._queue_patient_phone = None
+        self._queue_patient_id = None
 
     def preview_label(self, index):
         d = self.selected_drugs[index]
@@ -1947,9 +2071,9 @@ class LabelApp:
 
     # ---------------------------------------------------------------- print history
 
-    def open_print_history_dialog(self):
+    def open_print_history_dialog(self, pick_mode=False):
         win = tk.Toplevel(self.root)
-        win.title("แฟ้มประวัติการจ่ายยา")
+        win.title("แฟ้มประวัติการจ่ายยา - เลือกชื่อลูกค้า" if pick_mode else "แฟ้มประวัติการจ่ายยา")
         win.geometry(f"{fs(480)}x{fs(600)}")
         win.transient(self.root)
         win.grab_set()
@@ -2109,6 +2233,25 @@ class LabelApp:
             win.destroy()
             self.status_var.set(f"โหลดรายการซ้ำแล้ว ({len(job['drugs'])} รายการยา)")
 
+        def pick_name():
+            sel = job_list.curselection()
+            if not sel:
+                messagebox.showwarning("แจ้งเตือน", "กรุณาเลือกรายการก่อน", parent=win)
+                return
+            job = jobs[sel[0]]
+            name = job["patient_name"] or ""
+            phone = job.get("customer_phone") or ""
+            self._queue_patient_name = name
+            self._queue_patient_phone = phone
+            # Re-resolve rather than trust job["patient_id"] as-is: that job
+            # row may predate this column, or the patient may have been
+            # saved to a profile only after this particular print happened.
+            # Still never auto-creates - stays None if there's no
+            # unambiguous existing profile for this exact name+phone.
+            self._queue_patient_id = job.get("patient_id") or storage.find_patient_id(name, phone)
+            self.selected_customer_var.set("ลค: " + name + (f" ({phone})" if phone else ""))
+            self.status_var.set(f"เลือกชื่อลูกค้า '{name}' แล้ว - จะใส่ให้อัตโนมัติตอนกดยืนยันพิมพ์")
+
         def toggle_hidden():
             sel = job_list.curselection()
             if not sel:
@@ -2153,6 +2296,11 @@ class LabelApp:
 
         btn_row = tk.Frame(win)
         btn_row.pack(pady=(0, fs(8)))
+        if pick_mode:
+            tk.Button(
+                btn_row, text="✓ เลือกชื่อนี้", font=("Tahoma", fs(9), "bold"),
+                bg="#1a5a9a", fg="white", command=pick_name,
+            ).pack(side="left", padx=fs(4))
         tk.Button(
             btn_row, text="🔁 ใช้ซ้ำ (โหลดกลับมาพิมพ์)", font=("Tahoma", fs(9), "bold"),
             bg="#1a7a4a", fg="white", command=reuse_job,
@@ -2187,6 +2335,10 @@ class LabelApp:
             command=lambda: (search_var.set(""), result_list.delete(0, tk.END)),
         ).pack(side="left", padx=(fs(4), 0))
         tk.Button(search_row, text="ค้นหา", font=("Tahoma", fs(9)), command=lambda: do_search()).pack(side="left", padx=(fs(4), 0))
+        tk.Button(
+            search_row, text="📋 HN ทั้งหมด", font=("Tahoma", fs(9)),
+            command=lambda: self.open_all_hn_dialog(win, load_patient),
+        ).pack(side="left", padx=(fs(4), 0))
 
         result_list = tk.Listbox(win, font=("Tahoma", fs(9)), height=4, exportselection=False)
         result_list.pack(fill="x", padx=fs(10), pady=(0, fs(8)))
@@ -2253,7 +2405,8 @@ class LabelApp:
             current_patient["id"] = p["id"]
             current_patient["name"] = p["name"]
             current_patient["phone"] = p["phone"]
-            patient_name_var.set(p["name"] + (f" ({p['phone']})" if p["phone"] else ""))
+            hn_part = f"  [HN {p['hn_code']}]" if p.get("hn_code") else ""
+            patient_name_var.set(p["name"] + (f" ({p['phone']})" if p["phone"] else "") + hn_part)
             allergy_text.delete("1.0", "end")
             allergy_text.insert("1.0", p["allergy_note"])
             refresh_purchase_history()
@@ -2291,7 +2444,9 @@ class LabelApp:
             purchase_jobs.clear()
             if not current_patient["id"]:
                 return
-            jobs = storage.list_print_jobs_for_patient(current_patient["name"], current_patient["phone"])
+            jobs = storage.list_print_jobs_for_patient(
+                current_patient["name"], current_patient["phone"], patient_id=current_patient["id"]
+            )
             purchase_jobs.extend(jobs)
             if not jobs:
                 purchase_list.insert(tk.END, "(ยังไม่มีประวัติการซื้อ)")
@@ -2382,6 +2537,135 @@ class LabelApp:
         win.focus_force()
         search_entry.focus_set()
 
+    def open_all_hn_dialog(self, parent_win, on_pick):
+        """Management list of every patient/HN record - separate from the
+        search box above (which is for finding ONE patient to work with).
+        This is for browsing/cleaning up the whole list: sort by name or by
+        HN, delete a mistaken/duplicate entry, or wipe everything at once
+        for a store that just started using patient profiles and wants a
+        clean slate (test entries, wrong HN numbering, etc.)."""
+        win = tk.Toplevel(parent_win)
+        win.title("รายชื่อ HN ทั้งหมด")
+        win.geometry(f"{fs(420)}x{fs(520)}")
+        win.transient(parent_win)
+        win.grab_set()
+
+        top_row = tk.Frame(win)
+        top_row.pack(fill="x", padx=fs(10), pady=(fs(10), fs(4)))
+        tk.Label(top_row, text="เรียงตาม:", font=("Tahoma", fs(9))).pack(side="left")
+        sort_var = tk.StringVar(value="name")
+        tk.Radiobutton(
+            top_row, text="ชื่อ", variable=sort_var, value="name", font=("Tahoma", fs(9)),
+            command=lambda: refresh(),
+        ).pack(side="left")
+        tk.Radiobutton(
+            top_row, text="HN", variable=sort_var, value="hn_code", font=("Tahoma", fs(9)),
+            command=lambda: refresh(),
+        ).pack(side="left")
+
+        hn_list = tk.Listbox(win, font=("Tahoma", fs(9)), exportselection=False)
+        hn_list.pack(fill="both", expand=True, padx=fs(10), pady=(fs(2), fs(6)))
+
+        patients = []
+
+        def refresh():
+            patients.clear()
+            patients.extend(storage.list_all_patients(order_by=sort_var.get()))
+            hn_list.delete(0, tk.END)
+            for p in patients:
+                phone_part = f" - {p['phone']}" if p["phone"] else ""
+                hn_code = p["hn_code"] or "(ไม่มี HN)"
+                hn_list.insert(tk.END, f"{hn_code}  |  {p['name']}{phone_part}")
+
+        def selected_patient():
+            sel = hn_list.curselection()
+            if not sel:
+                messagebox.showwarning("แจ้งเตือน", "กรุณาเลือกรายการก่อน", parent=win)
+                return None
+            return patients[sel[0]]
+
+        def on_pick_row(event=None):
+            p = selected_patient()
+            if not p:
+                return
+            on_pick(p["id"])
+            win.destroy()
+
+        def delete_selected():
+            p = selected_patient()
+            if not p:
+                return
+            hn_code = p["hn_code"] or "(ไม่มี HN)"
+            if not messagebox.askyesno(
+                "ยืนยัน",
+                f"ลบ {hn_code} - {p['name']} ถาวรใช่ไหม?\n"
+                "(ประวัติการพิมพ์ฉลากเดิมของคนนี้จะยังอยู่ แค่ไม่ผูกกับโปรไฟล์นี้แล้ว)",
+                parent=win,
+            ):
+                return
+            storage.delete_patient(p["id"])
+            refresh()
+
+        def delete_all():
+            if not messagebox.askyesno(
+                "ยืนยันการลบทั้งหมด",
+                f"ลบข้อมูลผู้ป่วยทั้งหมด ({len(patients)} คน) รวม HN ทุกเลขถาวรใช่ไหม?\n"
+                "เอกสารแนบทั้งหมดจะถูกลบด้วย - กู้คืนไม่ได้\n"
+                "(ประวัติการพิมพ์ฉลากเดิมจะยังอยู่ แค่ไม่ผูกกับโปรไฟล์ผู้ป่วยคนไหนแล้ว "
+                "เลข HN ใหม่จะเริ่มนับจาก 00001 อีกครั้ง)",
+                parent=win,
+            ):
+                return
+            if not messagebox.askyesno(
+                "ยืนยันอีกครั้ง", "แน่ใจนะ? การลบนี้กู้คืนไม่ได้", parent=win,
+            ):
+                return
+            storage.delete_all_patients()
+            refresh()
+            self.status_var.set("ลบข้อมูลผู้ป่วย/HN ทั้งหมดแล้ว")
+
+        def assign_missing():
+            # Self-serve fix for rows like "(ไม่มี HN)" - can happen if a
+            # patient was created by an older build of this app (from
+            # before the hn_code column existed) still running against the
+            # same data.db, or any other gap. Safe to click any time: only
+            # touches rows that are still NULL, never reassigns an existing
+            # code.
+            n = storage.backfill_patient_hn_codes()
+            refresh()
+            if n:
+                messagebox.showinfo("เสร็จแล้ว", f"เติม HN ให้ผู้ป่วย {n} คนที่ยังไม่มีแล้ว", parent=win)
+            else:
+                messagebox.showinfo("แจ้งเตือน", "ทุกคนมี HN อยู่แล้ว ไม่มีอะไรต้องเติม", parent=win)
+
+        hn_list.bind("<Double-Button-1>", on_pick_row)
+
+        btn_row = tk.Frame(win)
+        btn_row.pack(fill="x", padx=fs(10), pady=(0, fs(4)))
+        tk.Button(
+            btn_row, text="✓ เลือก", font=("Tahoma", fs(9), "bold"), bg="#1a5a9a", fg="white",
+            command=on_pick_row,
+        ).pack(side="left", padx=(0, fs(4)))
+        tk.Button(
+            btn_row, text="🗑 ลบ", font=("Tahoma", fs(9), "bold"), bg="#b03a2e", fg="white",
+            command=delete_selected,
+        ).pack(side="left", padx=(0, fs(4)))
+        tk.Button(
+            btn_row, text="🗑 ลบทั้งหมด", font=("Tahoma", fs(9), "bold"), bg="#b03a2e", fg="white",
+            command=delete_all,
+        ).pack(side="right")
+
+        btn_row2 = tk.Frame(win)
+        btn_row2.pack(fill="x", padx=fs(10), pady=(0, fs(10)))
+        tk.Button(
+            btn_row2, text="🔧 เติม HN ให้คนที่ยังไม่มี", font=("Tahoma", fs(9)),
+            command=assign_missing,
+        ).pack(side="left")
+
+        refresh()
+        win.lift()
+        win.focus_force()
+
     # ---------------------------------------------------------------- confirm + print
 
     def on_confirm(self):
@@ -2402,8 +2686,11 @@ class LabelApp:
         tk.Label(win, text=f"พร้อมพิมพ์ {total_labels} ฉลาก ({len(self.selected_drugs)} รายการยา)",
                  font=("Tahoma", fs(10))).pack(pady=(fs(14), fs(4)))
         tk.Label(win, text="ชื่อ นามสกุล (ไม่บังคับ)", font=("Tahoma", fs(10), "bold")).pack(anchor="w", padx=fs(14))
+        # Not cleared here on open (only in on_print_done, once actually
+        # printed) - closing/cancelling this dialog to go fix something in
+        # the drug list shouldn't lose the picked name; reopening it should
+        # still show it.
         patient_var = tk.StringVar(value=self._queue_patient_name or "")
-        self._queue_patient_name = None  # one-shot - don't leak into the next unrelated print
         entry = tk.Entry(win, textvariable=patient_var, font=("Tahoma", fs(12)))
         entry.pack(fill="x", padx=fs(14), pady=fs(4))
         entry.select_range(0, "end")
@@ -2427,7 +2714,7 @@ class LabelApp:
         # and name/phone search-autocomplete only exist inside this popup,
         # opened on demand, so the common no-save path never touches the DB
         # with a search query.
-        phone_var = tk.StringVar(value="")
+        phone_var = tk.StringVar(value=self._queue_patient_phone or "")  # also only cleared in on_print_done
         save_state = {"save": False}
         save_status_var = tk.StringVar(value="")
 
@@ -2578,18 +2865,38 @@ class LabelApp:
             def worker():
                 try:
                     settings = app_settings.load_settings()
+                    # patient_id only ever comes from a real patients-table
+                    # record - either just created/found here (save ticked),
+                    # or already resolved unambiguously by pick_name(). A
+                    # typed name with no save and no prior pick stays
+                    # unlinked (None), same as before this feature existed.
                     if save_state["save"]:
-                        storage.find_or_create_patient(name, phone)
+                        patient_id = storage.find_or_create_patient(name, phone)
+                    else:
+                        patient_id = self._queue_patient_id
                     has_allergy = self.allergy_var.get()
+                    # Build every physical label first (one PIL image per
+                    # copy, print_qty duplicates reuse the same rendered
+                    # image object - content is identical per copy) before
+                    # deciding how to send them to the printer, since A4
+                    # mode needs to see the whole batch to tile them 2-up
+                    # per sheet instead of printing one-per-page.
+                    label_imgs = []
                     for d in self.selected_drugs:
                         data = dict(d)
                         data["patient_name"] = name
                         data["has_allergy"] = has_allergy
                         img = build_label_image(data, settings)
-                        img.save(DEBUG_PREVIEW_PATH)
-                        for _ in range(d.get("print_qty", 1)):
+                        label_imgs.extend([img] * d.get("print_qty", 1))
+                    if label_imgs:
+                        label_imgs[-1].save(DEBUG_PREVIEW_PATH)
+                    if settings.get("paper_mode") == "a4":
+                        for page in build_a4_pages(label_imgs):
+                            print_image(page)
+                    else:
+                        for img in label_imgs:
                             print_image(img)
-                    storage.add_print_job(name, phone, self.selected_drugs)
+                    storage.add_print_job(name, phone, self.selected_drugs, patient_id=patient_id)
                     self.root.after(0, lambda: self.on_print_done(win, total_labels))
                 except Exception as e:
                     self.root.after(0, lambda: status_var.set(f"เกิดข้อผิดพลาด: {e}"))
@@ -2597,9 +2904,43 @@ class LabelApp:
 
             threading.Thread(target=worker, daemon=True).start()
 
-        print_btn = tk.Button(win, text="\U0001F5A8️ พิมพ์ฉลาก", font=("Tahoma", fs(11), "bold"),
+        def save_history_only():
+            # For when the pharmacist just wants the visit remembered for
+            # next time (so it shows up in "แฟ้มประวัติการจ่ายยา" /
+            # "เลือกชื่อลูกค้า" later) without actually sending anything to
+            # the printer - e.g. a phone consult or a "what did they buy
+            # last time" lookup that didn't end in a real dispense.
+            name = "ไม่ประสงค์ออกนาม" if anon_var.get() else patient_var.get().strip()
+            phone = phone_var.get().strip()
+            history_btn.config(state="disabled")
+            print_btn.config(state="disabled")
+            status_var.set("กำลังบันทึกประวัติ...")
+
+            def worker():
+                try:
+                    if save_state["save"]:
+                        patient_id = storage.find_or_create_patient(name, phone)
+                    else:
+                        patient_id = self._queue_patient_id
+                    storage.add_print_job(name, phone, self.selected_drugs, patient_id=patient_id)
+                    self.root.after(0, lambda: self.on_history_saved(win))
+                except Exception as e:
+                    self.root.after(0, lambda: status_var.set(f"เกิดข้อผิดพลาด: {e}"))
+                    self.root.after(0, lambda: history_btn.config(state="normal"))
+                    self.root.after(0, lambda: print_btn.config(state="normal"))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        btn_row2 = tk.Frame(win)
+        btn_row2.pack(pady=fs(10))
+        print_btn = tk.Button(btn_row2, text="\U0001F5A8️ พิมพ์ฉลาก", font=("Tahoma", fs(11), "bold"),
                                bg="#1a7a4a", fg="white", command=do_print)
-        print_btn.pack(pady=fs(10))
+        print_btn.pack(side="left", padx=fs(4))
+        history_btn = tk.Button(
+            btn_row2, text="📋 บันทึกประวัติ (ไม่พิมพ์)", font=("Tahoma", fs(9)),
+            command=save_history_only,
+        )
+        history_btn.pack(side="left", padx=fs(4))
 
         win.bind("<Return>", lambda e: do_print())
         entry.focus_set()
@@ -2611,6 +2952,21 @@ class LabelApp:
         self.status_var.set(f"พิมพ์ครบ {total_labels} ฉลากแล้ว")
         self.selected_drugs = []
         self.allergy_var.set(False)
+        self.selected_customer_var.set(self.NO_CUSTOMER_TEXT)
+        self._queue_patient_name = None
+        self._queue_patient_phone = None
+        self._queue_patient_id = None
+        self.refresh_selected_list()
+
+    def on_history_saved(self, win):
+        win.destroy()
+        self.status_var.set("บันทึกประวัติแล้ว (ไม่ได้พิมพ์ฉลาก)")
+        self.selected_drugs = []
+        self.allergy_var.set(False)
+        self.selected_customer_var.set(self.NO_CUSTOMER_TEXT)
+        self._queue_patient_name = None
+        self._queue_patient_phone = None
+        self._queue_patient_id = None
         self.refresh_selected_list()
 
 
