@@ -29,6 +29,7 @@ import storage
 import app_settings
 import local_server
 import ai_assist
+import knowledge
 
 FAVORITES_PATH = os.path.join(storage.APP_DATA_DIR, "favorites.json")
 DEBUG_PREVIEW_PATH = os.path.join(storage.APP_DATA_DIR, "_last_label_preview.png")
@@ -50,7 +51,7 @@ def save_favorites(favorites):
         json.dump(favorites, f, ensure_ascii=False, indent=2)
 
 
-APP_VERSION = "1.11.0"
+APP_VERSION = "1.15.0"
 
 DOTS_PER_MM = 8  # matches standard 203dpi thermal label printers
 
@@ -596,13 +597,40 @@ def build_settings_dialog(parent, first_run=False):
     automatically on first run (no settings.json yet), reopenable any time
     via the ⚙️ ตั้งค่า button."""
     settings = app_settings.load_settings()
-    win = tk.Toplevel(parent)
-    win.title("ตั้งค่าเริ่มต้น (ครั้งแรก)" if first_run else "ตั้งค่า")
-    win.geometry(f"{fs(440)}x{fs(730)}")
-    win.transient(parent)
-    win.grab_set()
+    dialog_win = tk.Toplevel(parent)
+    dialog_win.title("ตั้งค่าเริ่มต้น (ครั้งแรก)" if first_run else "ตั้งค่า")
+    dialog_win.geometry(f"{fs(440)}x{fs(600)}")
+    dialog_win.transient(parent)
+    dialog_win.grab_set()
 
     pad = {"padx": fs(10), "pady": fs(4)}
+
+    # Footer (save + admin buttons) packed FIRST with side="bottom" so it
+    # claims its space at the bottom of the window before the scrollable
+    # area below gets whatever's left - this is what keeps "บันทึก" always
+    # visible no matter how many fields (e.g. the 3 API key entries) get
+    # added above it, instead of the footer silently getting pushed off the
+    # bottom of a fixed-height window.
+    footer = tk.Frame(dialog_win)
+    footer.pack(side="bottom", fill="x")
+
+    scroll_container = tk.Frame(dialog_win)
+    scroll_container.pack(side="top", fill="both", expand=True)
+    canvas = tk.Canvas(scroll_container, highlightthickness=0)
+    scrollbar = tk.Scrollbar(scroll_container, orient="vertical", command=canvas.yview)
+    win = tk.Frame(canvas)  # `win` = the scrollable content frame, all fields below attach here
+    win.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+    canvas_window = canvas.create_window((0, 0), window=win, anchor="nw")
+    canvas.bind("<Configure>", lambda e: canvas.itemconfig(canvas_window, width=e.width))
+    canvas.configure(yscrollcommand=scrollbar.set)
+    canvas.pack(side="left", fill="both", expand=True)
+    scrollbar.pack(side="right", fill="y")
+
+    def _on_mousewheel(event):
+        canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
+    canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
 
     if first_run:
         tk.Label(
@@ -673,7 +701,7 @@ def build_settings_dialog(parent, first_run=False):
         tk.Entry(win, textvariable=v, font=("Tahoma", fs(10)), show="•").pack(fill="x", padx=fs(10), pady=(0, fs(4)))
 
     status_var = tk.StringVar(value="")
-    tk.Label(win, textvariable=status_var, font=("Tahoma", fs(9)), fg="#a00",
+    tk.Label(footer, textvariable=status_var, font=("Tahoma", fs(9)), fg="#a00",
              wraplength=fs(400), justify="left").pack(padx=fs(10))
 
     def on_save():
@@ -697,34 +725,34 @@ def build_settings_dialog(parent, first_run=False):
             "pharmacist_names": pharm_var.get().strip(),
             **{ai_assist.PROVIDERS[k]["key_field"]: v.get().strip() for k, v in ai_key_vars.items()},
         })
-        win.destroy()
+        dialog_win.destroy()
 
     tk.Button(
-        win, text="💾 บันทึก", font=("Tahoma", fs(11), "bold"), bg="#1a7a4a", fg="white", command=on_save,
+        footer, text="💾 บันทึก", font=("Tahoma", fs(11), "bold"), bg="#1a7a4a", fg="white", command=on_save,
     ).pack(pady=fs(12))
 
     if not first_run:
         def on_clear_db():
             count = storage.count_templates()
             if count == 0:
-                messagebox.showinfo("แจ้งเตือน", "ยังไม่มีข้อมูลยาในเครื่องนี้เลย", parent=win)
+                messagebox.showinfo("แจ้งเตือน", "ยังไม่มีข้อมูลยาในเครื่องนี้เลย", parent=dialog_win)
                 return
             if not messagebox.askyesno(
                 "ยืนยันการล้างข้อมูล",
                 f"จะลบข้อมูลยาทั้งหมด {count} รายการออกจากเครื่องนี้ถาวร\n"
                 "(รายการยาที่กรอกวิธีใช้ไว้ทั้งหมดจะหายไป กู้คืนไม่ได้)\n\n"
                 "ยืนยันที่จะลบหรือไม่?",
-                icon="warning", parent=win,
+                icon="warning", parent=dialog_win,
             ):
                 return
             if not messagebox.askyesno("ยืนยันอีกครั้ง", "แน่ใจจริงๆ ใช่ไหม? ข้อมูลจะหายทั้งหมดและกู้คืนไม่ได้",
-                                        icon="warning", parent=win):
+                                        icon="warning", parent=dialog_win):
                 return
             removed = storage.clear_all_templates()
-            messagebox.showinfo("สำเร็จ", f"ลบข้อมูลยาแล้ว {removed} รายการ", parent=win)
+            messagebox.showinfo("สำเร็จ", f"ลบข้อมูลยาแล้ว {removed} รายการ", parent=dialog_win)
 
         tk.Button(
-            win, text="🗑 ล้าง DB (ลบข้อมูลยาทั้งหมด)", font=("Tahoma", fs(9)),
+            footer, text="🗑 ล้าง DB (ลบข้อมูลยาทั้งหมด)", font=("Tahoma", fs(9)),
             fg="#a02020", command=on_clear_db,
         ).pack(pady=(0, fs(10)))
 
@@ -733,20 +761,20 @@ def build_settings_dialog(parent, first_run=False):
                 title="บันทึกไฟล์สำรองข้อมูล", defaultextension=".zip",
                 filetypes=[("Zip files", "*.zip")],
                 initialfile=f"labelprinter_backup_{datetime.now().strftime('%Y%m%d')}.zip",
-                parent=win,
+                parent=dialog_win,
             )
             if not path:
                 return
             try:
                 export_backup(path)
             except Exception as e:
-                messagebox.showerror("ผิดพลาด", f"Export ไม่สำเร็จ: {e}", parent=win)
+                messagebox.showerror("ผิดพลาด", f"Export ไม่สำเร็จ: {e}", parent=dialog_win)
                 return
-            messagebox.showinfo("สำเร็จ", f"บันทึกไฟล์สำรองไว้ที่:\n{path}\n\nเอาไฟล์นี้ไปเปิดที่เครื่องใหม่แล้วกด Import ได้เลย", parent=win)
+            messagebox.showinfo("สำเร็จ", f"บันทึกไฟล์สำรองไว้ที่:\n{path}\n\nเอาไฟล์นี้ไปเปิดที่เครื่องใหม่แล้วกด Import ได้เลย", parent=dialog_win)
 
         def on_import():
             path = filedialog.askopenfilename(
-                title="เลือกไฟล์สำรองข้อมูล (.zip)", filetypes=[("Zip files", "*.zip")], parent=win,
+                title="เลือกไฟล์สำรองข้อมูล (.zip)", filetypes=[("Zip files", "*.zip")], parent=dialog_win,
             )
             if not path:
                 return
@@ -755,19 +783,19 @@ def build_settings_dialog(parent, first_run=False):
                 "การ Import จะเขียนทับข้อมูลยาทั้งหมด, Favorite, และข้อมูลร้าน "
                 "(ยกเว้นเครื่องพิมพ์) ในเครื่องนี้ทันที\nข้อมูลเดิมจะหายไปถ้าไม่ได้สำรองไว้ก่อน\n\n"
                 "ยืนยันที่จะ Import หรือไม่?",
-                icon="warning", parent=win,
+                icon="warning", parent=dialog_win,
             ):
                 return
             try:
                 import_backup(path)
             except Exception as e:
-                messagebox.showerror("ผิดพลาด", f"Import ไม่สำเร็จ: {e}", parent=win)
+                messagebox.showerror("ผิดพลาด", f"Import ไม่สำเร็จ: {e}", parent=dialog_win)
                 return
             messagebox.showinfo(
-                "สำเร็จ", "Import ข้อมูลสำเร็จ\n\nกรุณาปิดโปรแกรมแล้วเปิดใหม่เพื่อให้ข้อมูลอัปเดตครบถ้วน", parent=win)
-            win.destroy()
+                "สำเร็จ", "Import ข้อมูลสำเร็จ\n\nกรุณาปิดโปรแกรมแล้วเปิดใหม่เพื่อให้ข้อมูลอัปเดตครบถ้วน", parent=dialog_win)
+            dialog_win.destroy()
 
-        backup_row = tk.Frame(win)
+        backup_row = tk.Frame(footer)
         backup_row.pack(pady=(0, fs(10)))
         tk.Button(
             backup_row, text="📤 Export ข้อมูลทั้งหมด", font=("Tahoma", fs(9), "bold"),
@@ -778,9 +806,9 @@ def build_settings_dialog(parent, first_run=False):
             bg="#1a5a9a", fg="white", command=on_import,
         ).pack(side="left", padx=fs(4))
 
-    win.lift()
-    win.focus_force()
-    return win
+    dialog_win.lift()
+    dialog_win.focus_force()
+    return dialog_win
 
 
 class LabelApp:
@@ -2769,6 +2797,12 @@ class LabelApp:
         win.transient(parent_win)
         win.grab_set()
 
+        tk.Label(
+            win, text="รูปแบบ HN (ปี/เดือน/วัน เลขรันจาก 00001) - เช่น 260715-00001 คือวันที่ 15 ก.ค. 2026 (ค.ศ.) "
+                       "คนที่ 1 ของวันนั้น เลขรันจะเริ่มนับ 00001 ใหม่ทุกวัน",
+            font=("Tahoma", fs(8)), fg="#666", wraplength=fs(400), justify="left",
+        ).pack(anchor="w", padx=fs(10), pady=(0, fs(2)))
+
         top_row = tk.Frame(win)
         top_row.pack(fill="x", padx=fs(10), pady=(fs(10), fs(4)))
         tk.Label(top_row, text="เรียงตาม:", font=("Tahoma", fs(9))).pack(side="left")
@@ -2940,25 +2974,53 @@ class LabelApp:
 
         status_var = tk.StringVar(value="")
         tk.Label(win, textvariable=status_var, font=("Tahoma", fs(9)), fg="#666").pack(anchor="w", padx=fs(10))
+        source_var = tk.StringVar(value="")
+        tk.Label(win, textvariable=source_var, font=("Tahoma", fs(8)), fg="#1a7a4a",
+                 wraplength=fs(490), justify="left").pack(anchor="w", padx=fs(10))
+
+        # Kept only for this dialog's lifetime, never persisted. Sent back
+        # on every follow-up so the AI has context of what was already
+        # asked/answered - this is what makes it "remember", at the cost of
+        # growing token usage per turn (each new call resends the whole
+        # running conversation, not just the latest question).
+        history = []  # [{"role": "user"/"assistant", "text": ...}, ...]
 
         # Packed here (right after the prompt box) rather than at the very
         # end - a tall response Text with expand=True would otherwise push
-        # this button below the bottom of the window on shorter screens,
+        # these buttons below the bottom of the window on shorter screens,
         # same overflow problem seen earlier with the edit-drug dialog.
+        btn_row = tk.Frame(win)
+        btn_row.pack(pady=(fs(2), fs(8)))
         send_btn = tk.Button(
-            win, text="📤 ส่ง", font=("Tahoma", fs(10), "bold"), bg="#1a5a9a", fg="white", command=lambda: do_send(),
+            btn_row, text="📤 ส่ง", font=("Tahoma", fs(10), "bold"), bg="#1a5a9a", fg="white", command=lambda: do_send(),
         )
-        send_btn.pack(pady=(fs(2), fs(8)))
+        send_btn.pack(side="left", padx=(0, fs(6)))
+        clear_btn = tk.Button(
+            btn_row, text="🗑 ล้าง (เริ่มเรื่องใหม่)", font=("Tahoma", fs(10)), command=lambda: do_clear(),
+        )
+        clear_btn.pack(side="left")
 
-        tk.Label(win, text="คำตอบ", font=("Tahoma", fs(10), "bold")).pack(anchor="w", padx=fs(10), pady=(fs(4), 0))
+        tk.Label(win, text="บทสนทนา", font=("Tahoma", fs(10), "bold")).pack(anchor="w", padx=fs(10), pady=(fs(4), 0))
         response_text = tk.Text(win, font=("Tahoma", fs(10)), bd=1, relief="solid", wrap="word", state="disabled")
         response_text.pack(fill="both", expand=True, padx=fs(10), pady=(fs(2), fs(8)))
 
-        def set_response(text):
+        def append_transcript(label, text):
+            response_text.config(state="normal")
+            if response_text.index("1.0") != response_text.index("end-1c"):
+                response_text.insert(tk.END, "\n\n")
+            response_text.insert(tk.END, f"{label}\n{text}")
+            response_text.config(state="disabled")
+            response_text.see(tk.END)
+
+        def do_clear():
+            history.clear()
+            prompt_text.delete("1.0", tk.END)
             response_text.config(state="normal")
             response_text.delete("1.0", tk.END)
-            response_text.insert("1.0", text)
             response_text.config(state="disabled")
+            status_var.set("")
+            source_var.set("")
+            prompt_text.focus_set()
 
         def do_send():
             prompt = prompt_text.get("1.0", tk.END).strip()
@@ -2972,13 +3034,34 @@ class LabelApp:
             api_key = settings.get(provider_info["key_field"], "")
             send_btn.config(state="disabled")
             status_var.set(f"กำลังส่งไปที่ {provider_info['label']}...")
+            source_var.set("")
+            prompt_text.delete("1.0", tk.END)
+            append_transcript("🧑 เภสัชกร", prompt)
 
             def worker():
-                success, text = provider_info["call"](api_key, prompt)
+                results = knowledge.search_knowledge(prompt)
+                context = knowledge.format_context_block(results)
+                history_block = ""
+                if history:
+                    lines = [f"{'เภสัชกรถาม' if h['role'] == 'user' else 'AI ตอบ'}: {h['text']}" for h in history]
+                    history_block = "ประวัติการสนทนาก่อนหน้าในหัวข้อนี้ (ใช้ประกอบบริบท):\n" + "\n".join(lines) + "\n\n"
+                full_prompt = (
+                    f"{context}\n\n{history_block}คำถามล่าสุดจากเภสัชกร:\n{prompt}"
+                    if (context or history_block) else prompt
+                )
+                success, text = provider_info["call"](api_key, full_prompt)
                 def apply():
                     send_btn.config(state="normal")
                     status_var.set("" if success else "เกิดข้อผิดพลาด")
-                    set_response(text)
+                    if results:
+                        names = ", ".join(sorted({r["source"] for r in results}))
+                        source_var.set(f"📎 อ้างอิงจากเอกสาร: {names}")
+                    else:
+                        source_var.set("ℹ️ ไม่พบข้อมูลที่เกี่ยวข้องในเอกสารอ้างอิง (ตอบจากความรู้ทั่วไปของ AI)")
+                    append_transcript("🤖 AI", text)
+                    if success:
+                        history.append({"role": "user", "text": prompt})
+                        history.append({"role": "assistant", "text": text})
                 self.root.after(0, apply)
 
             threading.Thread(target=worker, daemon=True).start()

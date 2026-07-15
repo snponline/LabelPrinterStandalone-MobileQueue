@@ -75,6 +75,76 @@ per-conversation).
 `APP_VERSION` in `label_gui.py` (shown in the window title bar) — bump it whenever a commit ships
 a user-visible feature/fix batch, since there's no other version indicator in this app.
 
+- **1.15.0** — `build_settings_dialog()` (⚙️ ตั้งค่า) made scrollable: the 3 API key fields added
+  earlier this session pushed the "💾 บันทึก" button off the bottom of the fixed-height window on
+  smaller screens. Restructured into `dialog_win` (the real `Toplevel`) containing a `footer` Frame
+  (save + admin buttons - clear DB, export/import - packed `side="bottom"` FIRST so it always
+  claims its space) and a `Canvas`+`Scrollbar` scrollable area above it holding every form field,
+  mirroring the same pattern already used for the main drug list (`list_frame`/`_list_canvas`).
+  Mousewheel scrolling bound only while the cursor is over the canvas (`<Enter>`/`<Leave>` toggle
+  `bind_all`/`unbind_all`) so it doesn't hijack scroll events elsewhere while this dialog is open.
+  **Bug caught before shipping**: an early version of this refactor reassigned the local `win`
+  variable to point at the new scrollable content Frame (since all the field-adding code below was
+  already written against `win`) - but code further down still called `messagebox.showinfo(...,
+  parent=win)` and `win.destroy()`/`win.lift()`/`win.focus_force()`, all of which require an actual
+  `Toplevel`, not a plain `Frame`. Fixed by keeping the Toplevel under its own name (`dialog_win`)
+  throughout and only using `win` for the scrollable content Frame that the field widgets attach
+  to - caught by re-reading the full function before treating the refactor as done, not by a runtime
+  error surfacing it.
+- **1.14.0** — HN code format changed from `YYYY-NNNNN` (4-digit year, running number reset once a
+  **year**) to `YYMMDD-NNNNN` (2-digit year+month+day, running number reset once a **day**) - e.g.
+  `260715-00001` for the first patient created 2026-07-15. `_generate_hn_code(conn, date=None)` in
+  `storage.py` now takes a `date` (defaults to `datetime.now()`) instead of a bare `year`, and
+  builds the prefix via `date.strftime("%y%m%d")` instead of `f"{year}-"` - matching logic to
+  HOPE's SQL Server build in the same session. `backfill_patient_hn_codes()` updated to pass the
+  patient's full `created_at` datetime through instead of just its `.year`. Unit-tested directly
+  against an in-memory SQLite table: same-day inserts number sequentially (`260715-00001`,
+  `260715-00002`), a different day resets to `00001` (`260716-00001`) - confirmed correct before
+  touching the exe. New explanatory caption ("รูปแบบ HN (ปี/เดือน/วัน เลขรันจาก 00001) - เช่น
+  260715-00001 คือ...") added to the top of the "รายชื่อ HN ทั้งหมด" management dialog
+  (`open_all_hn_dialog`) so staff aren't left guessing what the digits mean - this was the actual
+  ask (the user had been reading the code that way already; the fix made the code match that
+  reading, not just labeled it).
+- **1.13.0** — "AI ช่วยค้นข้อมูล" dialog now keeps a running conversation (multi-turn, in-memory
+  only for the dialog's lifetime - never persisted to disk). Each send appends the exchange to a
+  scrolling transcript `Text` (renamed from "คำตอบ" to "บทสนทนา") instead of replacing it, and
+  `prompt_text` auto-clears itself right after a question is sent so the next one starts fresh
+  rather than accumulating inside the same box. New "🗑 ล้าง (เริ่มเรื่องใหม่)" button next to "ส่ง"
+  (same row, packed before the transcript `Text` - same overflow-avoidance reasoning as the send
+  button itself) resets `history`, both text widgets, and the status/source labels for a genuinely
+  new topic. Follow-up questions resend the *entire* prior exchange as a text block prepended to
+  the new prompt (`history_block` in `do_send`'s `worker()`) - this is what gives the AI memory,
+  since none of the 3 providers retain server-side state between our independent REST calls, but it
+  means token cost grows per turn within a conversation (each new call re-sends all prior turns as
+  input tokens), not just per question. Explained this tradeoff to the user before building - they
+  opted for memory anyway since the per-conversation increase is small in practice (a handful of
+  short turns), and the "ล้าง" button exists specifically so unrelated questions don't need to pay
+  that growing cost unnecessarily.
+- **1.12.0** — Local grounding for "AI ช่วยค้นข้อมูล" (phase 1.5, still no photo/patient-DB link
+  per 1.10.0's scope). New `knowledge.py` module: pharmacist drops `.txt`/`.md`/`.pdf` reference
+  files into `%LOCALAPPDATA%\LabelPrinterStandalone_MobileQueue\knowledge\`; `search_knowledge()`
+  does plain **character-bigram overlap scoring** (not word-token matching - Thai has no reliable
+  word boundaries without a segmenter library like pythainlp, and a run-on query phrase would never
+  exact-match a source doc phrased with different spacing) against paragraphs split out of those
+  files, entirely locally - no LLM call, no network call, effectively free. Top 2-3 matching
+  paragraphs get prepended to the prompt sent to whichever provider is selected, with an instruction
+  to ground the answer in them and say so explicitly if nothing relevant was found rather than
+  silently falling back to general knowledge unflagged. The dialog now shows which source file(s)
+  the answer was grounded in (or a note that none matched) under the status line. PDF text extraction
+  reuses `fitz` (PyMuPDF) - already a proven dependency in this codebase via the PDF user-guide
+  generator - confirmed bundling cleanly via PyInstaller (no missing-module warnings) and confirmed
+  actually extracting Thai text correctly (a naive first test using PyMuPDF's default font silently
+  produced garbled dot characters for the Thai glyphs - not a bug in extraction, just a test artifact
+  from not embedding a Thai-capable font; re-tested with `tahoma.ttf` embedded and got correct text).
+  **Explicitly not NotebookLM-backed** - evaluated and rejected: no stable public API for a
+  shop-level (non-Enterprise) NotebookLM account, and the only programmatic access options are an
+  Enterprise-tier Google Cloud API (wrong tier/cost profile for a single independent pharmacy) or
+  unofficial reverse-engineered libraries hitting undocumented internal endpoints (real risk of
+  silent breakage whenever Google changes those endpoints, and likely a ToS violation) - neither
+  acceptable for a tool the shop depends on daily. Local files the pharmacist controls directly are
+  the more durable choice, even though it means manually keeping the `knowledge/` folder in sync
+  with whatever's curated elsewhere (e.g. NotebookLM used purely as a human research aid, exported
+  to files afterward).
 - **1.11.0** — Main window now starts maximized (`root.state("zoomed")`, right after the existing
   `root.geometry()` call which stays as the fallback size if the window is later un-maximized) - the
   toolbar row (search label + 6 buttons: AI ช่วยค้นข้อมูล/ประวัติผู้ป่วย/แฟ้มประวัติการจ่ายยา/คิวจาก

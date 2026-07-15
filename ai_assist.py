@@ -62,7 +62,7 @@ def call_xai(api_key, prompt):
         resp = requests.post(
             "https://api.x.ai/v1/chat/completions",
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={"model": "grok-4", "messages": [{"role": "user", "content": prompt}], "max_tokens": 1000},
+            json={"model": "grok-4.5", "messages": [{"role": "user", "content": prompt}], "max_tokens": 1000},
             timeout=TIMEOUT_SECONDS,
         )
     except requests.RequestException as e:

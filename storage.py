@@ -759,12 +759,13 @@ def delete_all_patients():
         conn.close()
 
 
-def _generate_hn_code(conn, year=None):
-    """YYYY-NNNNN, 5-digit running number that resets each year. Computed
-    from the max existing suffix for that year rather than a row COUNT, so a
-    deleted patient record never causes a code to be reused."""
-    year = year or datetime.now().year
-    prefix = f"{year}-"
+def _generate_hn_code(conn, date=None):
+    """YYMMDD-NNNNN (Christian-era year/month/day, 2-digit year), 5-digit
+    running number that resets each day. Computed from the max existing
+    suffix for that day rather than a row COUNT, so a deleted patient
+    record never causes a code to be reused."""
+    date = date or datetime.now()
+    prefix = date.strftime("%y%m%d") + "-"
     rows = conn.execute("SELECT hn_code FROM patients WHERE hn_code LIKE ?", (prefix + "%",)).fetchall()
     max_n = 0
     for (code,) in rows:
@@ -825,7 +826,7 @@ def backfill_patient_hn_codes():
     """One-time (but safe to re-run - only touches rows still missing a
     code): assigns hn_code to patients created before this column existed.
     Processed oldest-first so earlier customers get the lower running
-    numbers within their creation year, same as if they'd gotten a code the
+    numbers within their creation day, same as if they'd gotten a code the
     day they were first added."""
     conn = _connect()
     try:
@@ -834,10 +835,10 @@ def backfill_patient_hn_codes():
         ).fetchall()
         for patient_id, created_at in rows:
             try:
-                year = datetime.fromisoformat(created_at).year
+                created_dt = datetime.fromisoformat(created_at)
             except (ValueError, TypeError):
-                year = datetime.now().year
-            code = _generate_hn_code(conn, year=year)
+                created_dt = datetime.now()
+            code = _generate_hn_code(conn, date=created_dt)
             conn.execute("UPDATE patients SET hn_code = ? WHERE id = ?", (code, patient_id))
             conn.commit()  # commit per-row so the next _generate_hn_code call sees this one
         return len(rows)
