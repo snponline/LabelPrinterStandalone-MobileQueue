@@ -75,6 +75,33 @@ per-conversation).
 `APP_VERSION` in `label_gui.py` (shown in the window title bar) — bump it whenever a commit ships
 a user-visible feature/fix batch, since there's no other version indicator in this app.
 
+- **1.17.0** — New standalone `knowledge_manager.py` / `KnowledgeManager.exe` (built via new
+  `build_knowledge_manager_exe.py`, own PyInstaller target) - deliberately a SEPARATE program from
+  `LabelPrinter.exe`, per explicit user request, so non-technical staff can be handed just this one
+  simple tool for maintaining the AI-assist knowledge base without touching the main app. `ttk.Treeview`
+  showing `knowledge/` as a folder tree (any depth), click a `.txt`/`.md` file to view+edit inline
+  and save, click a `.pdf`/`.docx` to view extracted text read-only (can't edit those formats
+  in-place - re-import to replace), toolbar buttons for new folder / new text file / import PDF or
+  Word files into the selected folder / delete (file or whole folder, confirms if non-empty).
+  Reuses `knowledge.py`'s own `KNOWLEDGE_DIR` and the (previously-private) `_extract_pdf_text`/
+  `_extract_docx_text` functions directly, rather than duplicating path resolution or parsing logic
+  - guarantees this tool can never point at a different folder than what the AI-assist feature
+  actually searches. `knowledge.py` itself gained `.docx` support (`_extract_docx_text`, via
+  `python-docx` - already a bundled dependency, confirmed importable) so Word files work identically
+  to PDF/txt at search time too, not just importable through the manager. `LabelPrinter.exe`
+  rebuilt (clean) to pick up the `.docx` search support - the manager tool alone wasn't enough,
+  since the already-built label-printing exe had the old pre-docx `knowledge.py` baked in. Verified:
+  recursive-scan smoke test (`KnowledgeManagerApp` instantiated headless, folder+file added,
+  confirmed found in the tree), and a real `.docx` created via `python-docx` round-tripped through
+  `search_knowledge()` correctly. Both new exes launch without error.
+- **1.16.0** — `knowledge/` folder scanning changed from flat (`glob.glob(KNOWLEDGE_DIR/*)`, top
+  level only) to recursive (`os.walk`), so the pharmacist can organize reference files into
+  subfolders (e.g. `ข้อมูลยา/`, `โรคเรื้อรัง/`, `โรคผิวหนัง/`, `โรคติดเชื้อ/`) for their own sanity -
+  search behavior is unchanged, it still searches every file regardless of which subfolder it's in,
+  no per-category routing. `source` in each result is now the path *relative to* `KNOWLEDGE_DIR`
+  (e.g. `"โรคผิวหนัง/ผื่นแพ้.txt"`, forward-slash normalized even on Windows) instead of the bare
+  filename, so the citation shown in the AI-assist dialog reveals which category it came from.
+  Verified with a real subfolder + file that recursive search finds and cites it correctly.
 - **1.15.0** — `build_settings_dialog()` (⚙️ ตั้งค่า) made scrollable: the 3 API key fields added
   earlier this session pushed the "💾 บันทึก" button off the bottom of the fixed-height window on
   smaller screens. Restructured into `dialog_win` (the real `Toplevel`) containing a `footer` Frame

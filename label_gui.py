@@ -1,6 +1,7 @@
 import sys
 import os
 import json
+import re
 import shutil
 import site
 import threading
@@ -51,7 +52,7 @@ def save_favorites(favorites):
         json.dump(favorites, f, ensure_ascii=False, indent=2)
 
 
-APP_VERSION = "1.15.0"
+APP_VERSION = "1.17.0"
 
 DOTS_PER_MM = 8  # matches standard 203dpi thermal label printers
 
@@ -375,6 +376,19 @@ def compute_dose_lines(data):
     return dose_text, line2
 
 
+def split_allergy_items(note):
+    """Split a free-text allergy note into individual drug-name items, best
+    effort - pharmacists type this field freeform with no fixed format, so
+    treat common separators (newline, comma, semicolon, Thai full stop) as
+    item boundaries. Used to decide whether a patient has exactly one known
+    drug allergy (safe to print directly on the label) or several (not
+    enough label space - fall back to "ดูแฟ้ม")."""
+    if not note:
+        return []
+    parts = re.split(r"[,\n;、]", note)
+    return [p.strip() for p in parts if p.strip()]
+
+
 def build_label_image(data, settings):
     label_w_px = int(settings["label_w_mm"]) * DOTS_PER_MM
     label_h_px = int(settings["label_h_mm"]) * DOTS_PER_MM
@@ -470,8 +484,20 @@ def build_label_image(data, settings):
     draw_thai_text(draw, (x, y), warning_text, f_medium, fill=0)
 
     # allergy status - flush right on the same line, underlined so it stands
-    # out from the generic warning text next to it
-    status_text = "แพ้ยา:ดูแฟ้ม" if data.get("has_allergy") else "ไม่แพ้ยา"
+    # out from the generic warning text next to it. If the patient has
+    # exactly one known drug allergy, print its name directly instead of the
+    # generic "ดูแฟ้ม" (see-file) notice - but only if it actually fits next
+    # to warning_text without overlapping; otherwise fall back to "ดูแฟ้ม"
+    # the same as when there are multiple/unknown allergies.
+    if not data.get("has_allergy"):
+        status_text = "ไม่แพ้ยา"
+    else:
+        allergy_drug_name = (data.get("allergy_drug_name") or "").strip()
+        status_text = f"แพ้ยา:{allergy_drug_name}" if allergy_drug_name else "แพ้ยา:ดูแฟ้ม"
+        warning_w = draw.textlength(warning_text, font=f_medium)
+        status_w = draw.textlength(status_text, font=f_medium)
+        if status_w > label_w_px - 2 * x - warning_w - 10:
+            status_text = "แพ้ยา:ดูแฟ้ม"
     status_w = draw.textlength(status_text, font=f_medium)
     status_x = label_w_px - x - status_w
     draw_thai_text(draw, (status_x, y), status_text, f_medium, fill=0)
@@ -926,9 +952,16 @@ class LabelApp:
             command=self.clear_all_drugs,
         ).pack(side="right", anchor="n", padx=(fs(6), 0))
         self.allergy_var = tk.BooleanVar(value=False)
+        allergy_frame = tk.Frame(list_header)
+        allergy_frame.pack(side="right", anchor="n", padx=(fs(6), 0))
         tk.Checkbutton(
-            list_header, text="⚠ แพ้ยา", variable=self.allergy_var, font=("Tahoma", fs(9), "bold"), fg="#b03a2e",
-        ).pack(side="right", anchor="n", padx=(fs(6), 0))
+            allergy_frame, variable=self.allergy_var, font=("Tahoma", fs(9), "bold"), fg="#b03a2e",
+        ).pack(side="left")
+        tk.Button(
+            allergy_frame, text="⚠ แพ้ยา", font=("Tahoma", fs(9), "bold"), fg="#b03a2e",
+            relief="flat", bd=0, cursor="hand2",
+            command=lambda: self.open_patient_profile_dialog(preload_patient_id=self._queue_patient_id),
+        ).pack(side="left")
 
         # Pick a returning customer straight from the existing "แฟ้มประวัติ
         # การจ่ายยา" dialog (it already has full search/browsing) instead of
@@ -1375,11 +1408,29 @@ class LabelApp:
         self._queue_patient_phone = None
         self._queue_patient_id = None
 
+    def _get_allergy_drug_name(self, patient_id):
+        """If patient_id has exactly one recorded drug allergy, return its
+        name so it can be printed directly on the label instead of the
+        generic "ดูแฟ้ม" notice. Multiple (or zero/unknown) allergies return
+        "" and the label falls back to "ดูแฟ้ม" as before."""
+        if not patient_id:
+            return ""
+        try:
+            patient = storage.get_patient(patient_id)
+        except Exception:
+            patient = None
+        if not patient:
+            return ""
+        items = split_allergy_items(patient.get("allergy_note") or "")
+        return items[0] if len(items) == 1 else ""
+
     def preview_label(self, index):
         d = self.selected_drugs[index]
         data = dict(d)
         data["patient_name"] = "(ชื่อผู้ป่วย)"
         data["has_allergy"] = self.allergy_var.get()
+        if data["has_allergy"]:
+            data["allergy_drug_name"] = self._get_allergy_drug_name(self._queue_patient_id)
         settings = app_settings.load_settings()
         img = build_label_image(data, settings)
 
@@ -1426,6 +1477,10 @@ class LabelApp:
                     row, text=name, font=("Tahoma", fs(9)), wraplength=fs(140), justify="left", anchor="w",
                     bg="#ffffff", relief="raised", command=lambda n=name: self.on_load_favorite(n),
                 ).pack(side="left", fill="x", expand=True)
+                tk.Button(
+                    row, text="💾", font=("Tahoma", fs(8)), width=2,
+                    command=lambda n=name: self.on_overwrite_favorite(n),
+                ).pack(side="left", padx=(fs(2), 0))
                 tk.Button(
                     row, text="✕", font=("Tahoma", fs(8), "bold"), fg="white", bg="#888888", width=2,
                     command=lambda n=name: self.on_delete_favorite(n),
@@ -1532,6 +1587,24 @@ class LabelApp:
         save_favorites(self.favorites)
         self.refresh_fav_buttons()
         self.status_var.set(f"บันทึก Favorite '{name}' แล้ว ({len(self.selected_drugs)} รายการยา)")
+
+    def on_overwrite_favorite(self, name):
+        if name not in self.favorites:
+            return
+        if not self.selected_drugs:
+            messagebox.showwarning("แจ้งเตือน", "กรุณาเลือกยาในรายการก่อนบันทึกทับ Favorite")
+            return
+        if not messagebox.askyesno("ยืนยัน", f"บันทึกทับ Favorite '{name}' ด้วยรายการปัจจุบันใช่ไหม?"):
+            return
+        snapshot = []
+        for d in self.selected_drugs:
+            entry = dict(d)
+            entry["override"] = d.get("status") == "edited"
+            snapshot.append(entry)
+        self.favorites[name] = snapshot
+        save_favorites(self.favorites)
+        self.refresh_fav_buttons()
+        self.status_var.set(f"บันทึกทับ Favorite '{name}' แล้ว ({len(self.selected_drugs)} รายการยา)")
 
     def _sync_copied_target(self, idproduct, drug):
         """After a copy-to save succeeds, refresh any matching row already in
@@ -2323,6 +2396,8 @@ class LabelApp:
         jobs = []
 
         def format_when(printed_at):
+            if printed_at is None:
+                return "(ยังไม่เคยพิมพ์)"
             try:
                 dt = datetime.fromisoformat(printed_at)
                 return dt.strftime("%d/%m/%Y %H:%M")
@@ -2345,6 +2420,26 @@ class LabelApp:
             except Exception as e:
                 messagebox.showerror("โหลดไม่สำเร็จ", str(e), parent=win)
                 return
+            if pick_mode and term:
+                # A patient profile (with allergy history) can be created
+                # directly in "ประวัติผู้ป่วย" without ever having a label
+                # printed for them - without this merge they'd never show up
+                # here since this list is normally sourced from print job
+                # history, making them impossible to pick as the current
+                # customer and impossible to auto-detect their allergy.
+                existing_ids = {j.get("patient_id") for j in jobs_raw if j.get("patient_id")}
+                try:
+                    patients = storage.search_patients(term)
+                except Exception:
+                    patients = []
+                for p in patients:
+                    if p["id"] in existing_ids:
+                        continue
+                    jobs_raw.append({
+                        "patient_name": p["name"], "customer_phone": p.get("phone", ""),
+                        "printed_at": None, "drugs": [], "patient_id": p["id"],
+                        "hidden": False, "archived": False,
+                    })
             jobs.clear()
             jobs.extend(jobs_raw)
             job_list.delete(0, tk.END)
@@ -2494,6 +2589,16 @@ class LabelApp:
             self.selected_customer_var.set("ลค: " + name + (f" ({phone})" if phone else ""))
             self.status_var.set(f"เลือกชื่อลูกค้า '{name}' แล้ว - จะใส่ให้อัตโนมัติตอนกดยืนยันพิมพ์")
             if self._queue_patient_id:
+                # Auto-tick "แพ้ยา" the moment we know this patient has any
+                # allergy history at all, regardless of how many drugs are in
+                # it - the pharmacist shouldn't have to remember to tick it
+                # manually after already picking a known allergic patient.
+                try:
+                    patient = storage.get_patient(self._queue_patient_id)
+                except Exception:
+                    patient = None
+                if patient and (patient.get("allergy_note") or "").strip():
+                    self.allergy_var.set(True)
                 show_patient_alert_popup(self._queue_patient_id)
 
         def toggle_hidden():
@@ -2596,6 +2701,10 @@ class LabelApp:
         )
 
         tk.Label(win, text="ประวัติแพ้ยา", font=("Tahoma", fs(10), "bold")).pack(anchor="w", padx=fs(10))
+        tk.Label(
+            win, text="(ถ้ามีหลายตัว ให้คั่นด้วย comma เช่น Amoxy, Diclofenac)",
+            font=("Tahoma", fs(8)), fg="#777",
+        ).pack(anchor="w", padx=fs(10))
         allergy_text = tk.Text(win, font=("Tahoma", fs(10)), height=3, bd=1, relief="solid")
         allergy_text.pack(fill="x", padx=fs(10), pady=(fs(2), fs(4)))
         tk.Button(
@@ -3279,6 +3388,7 @@ class LabelApp:
                     else:
                         patient_id = self._queue_patient_id
                     has_allergy = self.allergy_var.get()
+                    allergy_drug_name = self._get_allergy_drug_name(patient_id) if has_allergy else ""
                     # Build every physical label first (one PIL image per
                     # copy, print_qty duplicates reuse the same rendered
                     # image object - content is identical per copy) before
@@ -3290,6 +3400,7 @@ class LabelApp:
                         data = dict(d)
                         data["patient_name"] = name
                         data["has_allergy"] = has_allergy
+                        data["allergy_drug_name"] = allergy_drug_name
                         img = build_label_image(data, settings)
                         label_imgs.extend([img] * d.get("print_qty", 1))
                     if label_imgs:

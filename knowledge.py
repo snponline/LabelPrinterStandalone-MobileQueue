@@ -10,7 +10,6 @@ returns only the few relevant paragraphs to attach to the AI prompt. This
 keeps token cost low (a short snippet, not whole documents) and grounds the
 answer instead of relying purely on the model's own knowledge.
 """
-import glob
 import os
 import re
 
@@ -31,7 +30,7 @@ def ensure_knowledge_dir():
     if not os.path.isfile(readme_path) and not os.listdir(KNOWLEDGE_DIR):
         with open(readme_path, "w", encoding="utf-8") as f:
             f.write(
-                "วางไฟล์ .txt, .md หรือ .pdf ที่มีข้อมูลยา/โรคที่เชื่อถือได้ไว้ในโฟลเดอร์นี้\n"
+                "วางไฟล์ .txt, .md, .pdf หรือ .docx ที่มีข้อมูลยา/โรคที่เชื่อถือได้ไว้ในโฟลเดอร์นี้\n"
                 "ระบบจะค้นหาย่อหน้าที่เกี่ยวข้องจากไฟล์เหล่านี้มาแนบให้ AI ใช้ตอบคำถามอัตโนมัติ "
                 "(ค้นในเครื่อง ไม่ส่งไฟล์ทั้งหมดออกไปไหน แนบแค่ย่อหน้าที่เกี่ยวข้องเท่านั้น)\n"
             )
@@ -46,8 +45,24 @@ def _extract_pdf_text(path):
         doc.close()
 
 
+def _extract_docx_text(path):
+    import docx
+    d = docx.Document(path)
+    return "\n\n".join(p.text for p in d.paragraphs if p.text.strip())
+
+
+def _all_files():
+    # Recursive - the pharmacist can organize into subfolders (e.g.
+    # ข้อมูลยา/, โรคผิวหนัง/) for their own sanity when managing files; the
+    # search itself doesn't care about folder structure, it just needs to
+    # find everything under KNOWLEDGE_DIR regardless of depth.
+    for root, _dirs, files in os.walk(KNOWLEDGE_DIR):
+        for fname in files:
+            yield os.path.join(root, fname)
+
+
 def _folder_signature():
-    files = sorted(glob.glob(os.path.join(KNOWLEDGE_DIR, "*")))
+    files = sorted(_all_files())
     return tuple((f, os.path.getmtime(f)) for f in files if os.path.isfile(f))
 
 
@@ -57,12 +72,15 @@ def _load_documents():
         return _cache["docs"]
 
     docs = []
-    for path in glob.glob(os.path.join(KNOWLEDGE_DIR, "*")):
+    for path in _all_files():
         if not os.path.isfile(path):
             continue
         name = os.path.basename(path)
         if name == "README.txt":
             continue
+        # Relative path (e.g. "โรคผิวหนัง/ผื่นแพ้.txt") so a citation shows
+        # which category a snippet came from, not just the bare filename.
+        source = os.path.relpath(path, KNOWLEDGE_DIR).replace(os.sep, "/")
         ext = os.path.splitext(path)[1].lower()
         try:
             if ext in (".txt", ".md"):
@@ -70,6 +88,8 @@ def _load_documents():
                     text = f.read()
             elif ext == ".pdf":
                 text = _extract_pdf_text(path)
+            elif ext == ".docx":
+                text = _extract_docx_text(path)
             else:
                 continue
         except Exception:
@@ -77,7 +97,7 @@ def _load_documents():
         for para in re.split(r"\n\s*\n", text):
             para = para.strip()
             if len(para) >= 20:
-                docs.append((name, para))
+                docs.append((source, para))
 
     _cache["signature"] = signature
     _cache["docs"] = docs
