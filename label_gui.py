@@ -448,7 +448,17 @@ def build_label_image(data, settings):
 
     QTY_RESERVED_W = 150
     field("ชื่อผู้ป่วย", data["patient_name"], y, right_margin=QTY_RESERVED_W + 10)
-    dotted_field("จำนวน", label_w_px - x - QTY_RESERVED_W, y, QTY_RESERVED_W)
+    qty_x = label_w_px - x - QTY_RESERVED_W
+    label_qty = (data.get("label_qty") or "").strip()
+    if not label_qty.isdigit():
+        label_qty = ""
+    if label_qty:
+        # A quantity was actually keyed in for this label - print it
+        # directly instead of leaving a blank line for the pharmacist to
+        # handwrite it in.
+        draw_thai_text(draw, (qty_x, y), f"#{label_qty}", f_label_big, fill=0)
+    else:
+        dotted_field("จำนวน", qty_x, y, QTY_RESERVED_W)
     y += 34
     field("ชื่อยา", data["drug1"], y)
     y += 32
@@ -468,7 +478,12 @@ def build_label_image(data, settings):
 
     line2_font = fit_font(draw, line2, label_w_px - 2 * x - QTY_RESERVED_W - 10, 24, bold=True)
     draw_thai_text(draw, (x, y), line2, line2_font, fill=0)
-    dotted_field("EXP", label_w_px - x - QTY_RESERVED_W, y + 4, QTY_RESERVED_W)
+    exp_x = label_w_px - x - QTY_RESERVED_W
+    exp_date = (data.get("exp_date") or "").strip()
+    if exp_date:
+        draw_thai_text(draw, (exp_x, y + 4), f"EXP {exp_date}", f_label_big, fill=0)
+    else:
+        dotted_field("EXP", exp_x, y + 4, QTY_RESERVED_W)
     y += 40
 
     extra = data.get("extra_labels") or []
@@ -1210,6 +1225,8 @@ class LabelApp:
                 "barcode": info.get("barcode", ""),
                 "status": "db",
                 "print_qty": 1,
+                "exp_date": info.get("exp_date", ""),
+                "label_qty": info.get("label_qty", ""),
             }
         else:
             entry = {
@@ -1222,6 +1239,8 @@ class LabelApp:
                 "barcode": (info.get("barcode", "") if info else ""),
                 "status": "missing",
                 "print_qty": 1,
+                "exp_date": (info.get("exp_date", "") if info else ""),
+                "label_qty": (info.get("label_qty", "") if info else ""),
             }
         self.selected_drugs.append(entry)
         self.refresh_selected_list()
@@ -1237,7 +1256,7 @@ class LabelApp:
             "idproduct": None, "drug1": "", "drug2": "", "note": "", "qty": "",
             "unit": "เม็ด", "per_day": "", "every_hr": "", "meal": "หลังอาหาร",
             "times": [], "extra_labels": [], "usage_mode": "oral", "barcode": "",
-            "status": "missing", "print_qty": 1,
+            "status": "missing", "print_qty": 1, "exp_date": "", "label_qty": "",
         }
         self.selected_drugs.append(entry)
         index = len(self.selected_drugs) - 1
@@ -1365,7 +1384,54 @@ class LabelApp:
             name_label.pack(side="left", fill="x", expand=True)
             name_label.bind("<Double-Button-1>", lambda e, idx=i: self.open_edit_dialog(idx))
 
-            tk.Label(row, text="จำนวน", font=("Tahoma", fs(10))).pack(side="left", padx=(fs(6), fs(2)))
+            # exp_date/label_qty are remembered per-drug (drug_templates
+            # columns) once the drug already has a saved template - a shop
+            # dispenses from the same lot for a while, so auto-persisting on
+            # every edit means the next time this drug is added, both fields
+            # come back prefilled instead of typed fresh each time. A
+            # brand-new/unsaved drug (idproduct None) just keeps the value
+            # in-memory for this session, same as before - don't silently
+            # create a half-filled DB row from typing only these 2 fields.
+            def persist_exp_and_qty(idx):
+                entry = self.selected_drugs[idx]
+                idproduct = entry.get("idproduct")
+                if not idproduct:
+                    return
+
+                def worker():
+                    try:
+                        save_product_med_info(idproduct, entry)
+                    except Exception:
+                        pass  # best-effort remember - never block typing on a DB hiccup
+
+                threading.Thread(target=worker, daemon=True).start()
+
+            tk.Label(row, text="EXP", font=("Tahoma", fs(10))).pack(side="left", padx=(fs(6), fs(2)))
+            exp_var = tk.StringVar(value=str(d.get("exp_date", "")))
+
+            def on_exp_change(*args, idx=i, var=exp_var):
+                self.selected_drugs[idx]["exp_date"] = var.get().strip()
+                persist_exp_and_qty(idx)
+
+            exp_var.trace_add("write", on_exp_change)
+            tk.Entry(row, textvariable=exp_var, width=6, font=("Tahoma", fs(10)), justify="center").pack(side="left", padx=fs(2))
+
+            # #บนฉลาก - the quantity actually printed ON the label itself
+            # (e.g. "#30" for 30 tablets dispensed). Left blank, the label
+            # keeps the handwritten blank line as before (see
+            # build_label_image). Distinct from #ฉลาก below, which is how
+            # many physical label copies to print.
+            tk.Label(row, text="#บนฉลาก", font=("Tahoma", fs(10))).pack(side="left", padx=(fs(6), fs(2)))
+            label_qty_var = tk.StringVar(value=str(d.get("label_qty", "")))
+
+            def on_label_qty_change(*args, idx=i, var=label_qty_var):
+                self.selected_drugs[idx]["label_qty"] = var.get().strip()
+                persist_exp_and_qty(idx)
+
+            label_qty_var.trace_add("write", on_label_qty_change)
+            tk.Entry(row, textvariable=label_qty_var, width=5, font=("Tahoma", fs(10)), justify="center").pack(side="left", padx=fs(2))
+
+            tk.Label(row, text="#ฉลาก", font=("Tahoma", fs(10))).pack(side="left", padx=(fs(6), fs(2)))
             qty_var = tk.StringVar(value=str(d.get("print_qty", 1)))
 
             def on_qty_change(*args, idx=i, var=qty_var):
@@ -1375,6 +1441,7 @@ class LabelApp:
 
             qty_var.trace_add("write", on_qty_change)
             tk.Entry(row, textvariable=qty_var, width=3, font=("Tahoma", fs(10)), justify="center").pack(side="left", padx=fs(2))
+            tk.Label(row, text="แผ่น", font=("Tahoma", fs(10))).pack(side="left", padx=(fs(2), fs(4)))
 
             tk.Button(
                 row, text="👁 Preview", font=("Tahoma", fs(9)),

@@ -43,6 +43,14 @@ def _connect():
     if "barcode" not in existing_cols:
         conn.execute("ALTER TABLE drug_templates ADD COLUMN barcode TEXT")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_drug_templates_barcode ON drug_templates(barcode)")
+    # exp_date/label_qty remember the EXP and on-label quantity most
+    # recently entered for this drug - a pharmacy dispenses from the same
+    # lot/stock for a while, so these stay valid defaults across many
+    # prints until the lot actually changes.
+    if "exp_date" not in existing_cols:
+        conn.execute("ALTER TABLE drug_templates ADD COLUMN exp_date TEXT")
+    if "label_qty" not in existing_cols:
+        conn.execute("ALTER TABLE drug_templates ADD COLUMN label_qty TEXT")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS print_queue (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -200,14 +208,16 @@ def get_template(idproduct):
     try:
         cur = conn.cursor()
         cur.execute(
-            "SELECT drug1, drug2, note, qty, unit, per_day, every_hr, meal, times, extra_labels, usage_mode, barcode "
+            "SELECT drug1, drug2, note, qty, unit, per_day, every_hr, meal, times, extra_labels, usage_mode, barcode, "
+            "exp_date, label_qty "
             "FROM drug_templates WHERE id = ?",
             (idproduct,),
         )
         row = cur.fetchone()
         if not row:
             return None
-        drug1, drug2, note, qty, unit, per_day, every_hr, meal, times_json, extra_json, usage_mode, barcode = row
+        (drug1, drug2, note, qty, unit, per_day, every_hr, meal, times_json, extra_json, usage_mode, barcode,
+         exp_date, label_qty) = row
         return {
             "drug1": drug1, "drug2": drug2 or "", "note": note or "",
             "qty": qty or "", "unit": unit or "", "per_day": per_day or "",
@@ -216,6 +226,8 @@ def get_template(idproduct):
             "extra_labels": json.loads(extra_json) if extra_json else [],
             "usage_mode": usage_mode or "oral",
             "barcode": barcode or "",
+            "exp_date": exp_date or "",
+            "label_qty": label_qty or "",
         }
     finally:
         conn.close()
@@ -234,30 +246,36 @@ def upsert_template(idproduct, drug):
         extra_json = json.dumps(drug.get("extra_labels") or [], ensure_ascii=False)
         usage_mode = drug.get("usage_mode", "oral")
         barcode = (drug.get("barcode") or "").strip()
+        exp_date = (drug.get("exp_date") or "").strip()
+        label_qty = (drug.get("label_qty") or "").strip()
         now = datetime.now().isoformat()
         if idproduct:
             cur.execute(
                 """
                 UPDATE drug_templates SET
                     drug1 = ?, drug2 = ?, note = ?, qty = ?, unit = ?, per_day = ?,
-                    every_hr = ?, meal = ?, times = ?, extra_labels = ?, usage_mode = ?, barcode = ?, updated_at = ?
+                    every_hr = ?, meal = ?, times = ?, extra_labels = ?, usage_mode = ?, barcode = ?,
+                    exp_date = ?, label_qty = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (drug["drug1"], drug.get("drug2", ""), drug.get("note", ""), drug.get("qty", ""),
                  drug.get("unit", ""), drug.get("per_day", ""), drug.get("every_hr", ""),
-                 drug.get("meal", ""), times_json, extra_json, usage_mode, barcode, now, idproduct),
+                 drug.get("meal", ""), times_json, extra_json, usage_mode, barcode,
+                 exp_date, label_qty, now, idproduct),
             )
             row_id = idproduct
         else:
             cur.execute(
                 """
                 INSERT INTO drug_templates
-                    (drug1, drug2, note, qty, unit, per_day, every_hr, meal, times, extra_labels, usage_mode, barcode, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (drug1, drug2, note, qty, unit, per_day, every_hr, meal, times, extra_labels, usage_mode, barcode,
+                     exp_date, label_qty, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (drug["drug1"], drug.get("drug2", ""), drug.get("note", ""), drug.get("qty", ""),
                  drug.get("unit", ""), drug.get("per_day", ""), drug.get("every_hr", ""),
-                 drug.get("meal", ""), times_json, extra_json, usage_mode, barcode, now),
+                 drug.get("meal", ""), times_json, extra_json, usage_mode, barcode,
+                 exp_date, label_qty, now),
             )
             row_id = cur.lastrowid
         conn.commit()
