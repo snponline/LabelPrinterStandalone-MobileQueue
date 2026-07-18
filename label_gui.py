@@ -66,32 +66,46 @@ UNIT_OPTIONS = ["เม็ด", "แคปซูล", "ช้อนชา", "ช
 # translated here - drug names/notes/extra_labels are whatever the
 # pharmacist actually typed and are never auto-translated (medical-accuracy
 # risk), so English/Burmese output still needs those typed in that language.
-LABEL_LANGS = ["th", "en"]
-LABEL_LANG_NAMES = {"th": "ไทย", "en": "English"}
+LABEL_LANGS = ["th", "en", "mm"]
+LABEL_LANG_NAMES = {"th": "ไทย", "en": "English", "mm": "မြန်မာ"}
 TIME_EN = {"เช้า": "Morning", "เที่ยง": "Noon", "เย็น": "Evening", "ก่อนนอน": "Before bed"}
 MEAL_EN = {"ก่อนอาหาร": "Before meals", "หลังอาหาร": "After meals"}
 UNIT_EN = {
     "เม็ด": "tab(s)", "แคปซูล": "cap(s)", "ช้อนชา": "tsp(5ml)", "ช้อนโต๊ะ": "tbsp(15ml)",
     "ซอง": "sachet(s)", "ml": "ml", "หยด": "drop(s)", "พ่น": "spray(s)",
 }
+# Burmese - translated/reviewed by a Burmese-speaking pharmacist contact
+# (not machine-translated), same caution as the English set above.
+TIME_MM = {"เช้า": "မနက်", "เที่ยง": "နေ့ခင်း", "เย็น": "ညနေ", "ก่อนนอน": "အိပ်ခါနီး"}
+MEAL_MM = {"ก่อนอาหาร": "အစားမစားမီ", "หลังอาหาร": "အစားစားပြီး"}
+UNIT_MM = {
+    "เม็ด": "ဆေးပြား", "แคปซูล": "ဆေးတောင့်", "ช้อนชา": "လက်ဖက်ရည်ဇွန်း", "ช้อนโต๊ะ": "စားပွဲတင်ဇွန်း",
+    "ซอง": "ထုပ်", "ml": "ml", "หยด": "စက်", "พ่น": "ဖျန်း",
+}
+TIME_TR = {"en": TIME_EN, "mm": TIME_MM}
+MEAL_TR = {"en": MEAL_EN, "mm": MEAL_MM}
+UNIT_TR = {"en": UNIT_EN, "mm": UNIT_MM}
 
 
 def _tr_times(times, lang):
-    if lang != "en":
+    table = TIME_TR.get(lang)
+    if not table:
         return list(times or [])
-    return [TIME_EN.get(t, t) for t in (times or [])]
+    return [table.get(t, t) for t in (times or [])]
 
 
 def _tr_meal(meal, lang):
-    if lang != "en":
+    table = MEAL_TR.get(lang)
+    if not table:
         return meal or ""
-    return MEAL_EN.get(meal, meal or "")
+    return table.get(meal, meal or "")
 
 
 def _tr_unit(unit, lang):
-    if lang != "en":
+    table = UNIT_TR.get(lang)
+    if not table:
         return unit or "เม็ด"
-    return UNIT_EN.get(unit, unit or "tab(s)")
+    return table.get(unit, unit or "เม็ด")
 
 EXTRA_LABEL_OPTIONS_BY_MODE = {
     "oral": [
@@ -291,26 +305,46 @@ def read_excel_drug_names_and_barcodes(path, name_column=None, barcode_column=No
     return rows_out
 
 
-def find_font(size, bold=False):
-    candidates = (
-        [r"C:\Windows\Fonts\tahomabd.ttf", r"C:\Windows\Fonts\leelawui.ttf"]
-        if bold else
-        [r"C:\Windows\Fonts\tahoma.ttf", r"C:\Windows\Fonts\leelawue.ttf"]
-    )
+def find_font(size, bold=False, lang="th"):
+    # Tahoma/Leelawadee UI have no Myanmar glyphs at all - a Burmese label
+    # needs the Windows-bundled Myanmar Text font instead, for every string
+    # (including digits/EXP), not just the translated phrases.
+    if lang == "mm":
+        candidates = [r"C:\Windows\Fonts\mmrtextb.ttf"] if bold else [r"C:\Windows\Fonts\mmrtext.ttf"]
+    else:
+        candidates = (
+            [r"C:\Windows\Fonts\tahomabd.ttf", r"C:\Windows\Fonts\leelawui.ttf"]
+            if bold else
+            [r"C:\Windows\Fonts\tahoma.ttf", r"C:\Windows\Fonts\leelawue.ttf"]
+        )
     for path in candidates:
         if os.path.isfile(path):
             return ImageFont.truetype(path, size)
     return ImageFont.load_default()
 
 
-def fit_font(draw, text, max_width, start_size, bold=False, min_size=14):
+def detect_font_lang(text):
+    """Free-typed fields (patient name, drug1/drug2, note) can hold Thai,
+    English, or Burmese text depending on what the pharmacist actually
+    typed there - pick the font by inspecting the real characters instead
+    of trusting the label-language dropdown, since e.g. a patient's name
+    is Thai even on a Burmese-language label, while a pharmacist who has
+    an expert's Burmese translation for the indication should have that
+    render correctly too."""
+    for ch in text or "":
+        if 0x1000 <= ord(ch) <= 0x109F:
+            return "mm"
+    return "th"
+
+
+def fit_font(draw, text, max_width, start_size, bold=False, min_size=14, lang="th"):
     """Shrink font size until text fits max_width, so long drug/patient
     names never overflow past the edge of the sticker."""
     size = start_size
-    font = find_font(size, bold=bold)
+    font = find_font(size, bold=bold, lang=lang)
     while size > min_size and draw.textlength(text, font=font) > max_width:
         size -= 1
-        font = find_font(size, bold=bold)
+        font = find_font(size, bold=bold, lang=lang)
     return font
 
 
@@ -427,6 +461,31 @@ def compute_dose_lines(data):
                 line2 += f"   every {data['every_hr']} hr"
         return dose_text, line2
 
+    if lang == "mm":
+        if usage_mode == "topical":
+            dose_text = f"တစ်နေ့ {data.get('per_day') or '__'} ကြိမ် ပါးပါးလိမ်းပေးပါ"
+            line2 = "  ".join(times)
+            if data.get("every_hr"):
+                line2 += f"   နာရီ {data['every_hr']} တိုင်း"
+        elif usage_mode == "drops":
+            dose_text = f"တစ်ခါခတ်လျှင် {data.get('qty') or '__'} စက်"
+            if data.get("per_day"):
+                dose_text += f"၊ တစ်နေ့ {data['per_day']} ကြိမ် ခတ်ပါ"
+            line2 = "  ".join(times)
+            if data.get("every_hr"):
+                line2 += f"   နာရီ {data['every_hr']} တိုင်း"
+        else:
+            unit = _tr_unit(data.get("unit"), lang)
+            dose_text = f"တစ်ခါသောက်လျှင် {unit} {data.get('qty') or '__'}"
+            if data.get("per_day"):
+                dose_text += f"၊ တစ်နေ့ {data['per_day']} ကြိမ် သောက်ပါ"
+            line2 = _tr_meal(data.get("meal"), lang)
+            if times:
+                line2 += ("    " if line2 else "") + "  ".join(times)
+            if data.get("every_hr"):
+                line2 += f"   နာရီ {data['every_hr']} တိုင်း"
+        return dose_text, line2
+
     if usage_mode == "topical":
         # ยาทา: no unit/meal - "ทาบางๆ วันละ N ครั้ง" then times/every_hr only
         dose_text = f"ทาบางๆ วันละ {data.get('per_day') or '__'} ครั้ง"
@@ -489,26 +548,89 @@ EXTRA_LABEL_EN = {
     "หยดต่อเนื่อง 2 สัปดาห์": "Use continuously for 2 weeks",
     "ยาหยอดตาใช้ได้ 3 เดือน": "Discard 3 months after opening",
 }
+EXTRA_LABEL_MM = {
+    "ทานยาก่อนอาหาร 1/2-1 ชม": "ဆေးကို အစားမစားမီ မိနစ် ၃၀ မှ ၁ နာရီကြိုသောက်ပါ",
+    "ทานยาหลังอาหารทันที": "အစားစားပြီးချင်း ဆေးချက်ချင်းသောက်ပါ",
+    "ทานติดต่อกันจนหมด": "ဆေးကုန်သည်အထိ ဆက်တိုက်သောက်ပါ",
+    "ดื่มน้ำตามมากๆ": "ရေများများသောက်ပေးပါ",
+    "ยานี้อาจทำให้ง่วงซึม": "ဤဆေးသည် အိပ်ငိုက်စေနိုင်သည်",
+    "ห้ามรับประทานพร้อมนม ยาลดกรด": "နို့ သို့မဟုတ် အစာအိမ်ဆေးများနှင့် တွဲမသောက်ရ",
+    "ทานเมื่อมีอาการ": "ရောဂါလက္ခဏာရှိမှ သောက်ပါ",
+    "หายแล้ว ทาต่ออีก 1 สัปดาห์": "သက်သာပြေကင်းသွားသော်လည်း ၁ ပတ်ဆက်လိမ်းပါ",
+    "ทาต่อเนื่อง 2 สัปดาห์": "၂ ပတ်ဆက်တိုက် လိမ်းပေးပါ",
+    "หยดเมื่อมีอาการ": "ရောဂါလက္ခဏာရှိမှ ခတ်ပါ",
+    "หยดต่อเนื่อง 2 สัปดาห์": "၂ ပတ်ဆက်တိုက် ခတ်ပေးပါ",
+    "ยาหยอดตาใช้ได้ 3 เดือน": "မျက်စဉ်းဆေးကို ဖွင့်ပြီး ၃ လအထိသာ သုံးစွဲနိုင်သည်",
+}
+EXTRA_LABEL_TR = {"en": EXTRA_LABEL_EN, "mm": EXTRA_LABEL_MM}
 
 
 def _tr_extra_labels(extra_labels, lang):
-    if lang != "en":
+    table = EXTRA_LABEL_TR.get(lang)
+    if not table:
         return list(extra_labels or [])
-    return [EXTRA_LABEL_EN.get(e, e) for e in (extra_labels or [])]
+    return [table.get(e, e) for e in (extra_labels or [])]
+
+
+EN_STRINGS = {
+    "date_label": "Date",
+    "patient_label": "Patient",
+    "qty_label": "Qty",
+    "drug_label": "Drug",
+    "generic_label": "Generic Name",
+    "warning_text": "Inform Pharmacist: drug allergy, pregnancy, breastfeeding, med condition",
+    "align_marker": "breastfeeding,",
+    "no_allergy_text": "No known allergy",
+    "see_file_text": "Allergy: see file",
+    "allergy_prefix": "Allergy: ",
+    "pharm_label": "Pharmacist",
+}
+# Burmese - reviewed/translated by a Burmese-speaking pharmacist contact,
+# not machine-translated (same caution as EN_STRINGS).
+MM_STRINGS = {
+    "date_label": "ရက်စွဲ",
+    "patient_label": "လူနာအမည်",
+    "qty_label": "အရေအတွက်",
+    "drug_label": "ဆေးအမည်",
+    "generic_label": "ဆေးအမျိုးအမည်",
+    "warning_text": "ဆေးမတည့်၊ရောဂါအခံရှိ၊ကိုယ်ဝန်၊နို့တိုက်မိခင်ဖြစ်ကဆေးမှုအားပြေပါ။",
+    "align_marker": "နို့တိုက်",
+    "no_allergy_text": "ဆေးဓာတ်မတည့်ခြင်းမရှိပါ",
+    "see_file_text": "ဆေးဓာတ်မတည့်မှု - မှတ်တမ်းတွင်ကြည့်ပါ",
+    "allergy_prefix": "ဆေးဓာတ်မတည့်မှု - ",
+    "pharm_label": "ဆေးဝါးပညာရှင်",
+}
+LANG_STRINGS = {"en": EN_STRINGS, "mm": MM_STRINGS}
 
 
 def build_label_image(data, settings):
     lang = data.get("lang", "th")
+    L = LANG_STRINGS.get(lang, {})
+
+    def ls(key, thai_default):
+        if key in L:
+            return L[key]
+        if lang == "mm":
+            # mmrtext.ttf has no Thai glyphs - if a Burmese string is still
+            # missing for this key, fall back to English (Latin renders
+            # fine in mmrtext) rather than Thai (would draw as tofu boxes).
+            return EN_STRINGS.get(key, thai_default)
+        return thai_default
+
     label_w_px = int(settings["label_w_mm"]) * DOTS_PER_MM
     label_h_px = int(settings["label_h_mm"]) * DOTS_PER_MM
 
     img = Image.new("L", (label_w_px, label_h_px), 255)
     draw = ImageDraw.Draw(img)
 
-    f_small = find_font(15)
-    f_medium = find_font(18)
-    f_normal = find_font(19)
-    f_label_big = find_font(23)
+    f_small = find_font(15, lang=lang)
+    f_medium = find_font(18, lang=lang)
+    f_normal = find_font(19, lang=lang)
+    f_label_big = find_font(23, lang=lang)
+    # Company name is fixed shop-identity text (from settings, not
+    # per-label translated text) and is typically Thai script - always
+    # draw it with the Thai/Latin-capable font, even on a Burmese label,
+    # since mmrtext.ttf has no Thai glyphs.
     f_bold = find_font(25, bold=True)
 
     x = 24
@@ -526,9 +648,9 @@ def build_label_image(data, settings):
     draw_thai_text(draw, (x, y), company_name, f_bold, fill=0)
 
     DATE_RESERVED_W = 180
-    if lang == "en":
+    if lang in ("en", "mm"):
         today_str = datetime.now().strftime("%d/%m/%Y")
-        date_label = "Date"
+        date_label = ls("date_label", "วันที่")
     else:
         today_str = datetime.now().strftime("%d/%m/") + str(datetime.now().year + 543)
         date_label = "วันที่"
@@ -540,6 +662,7 @@ def build_label_image(data, settings):
     y += 30
     address_text = f"{settings.get('address_line1') or ''} {settings.get('address_line2') or ''}".strip()
     if address_text:
+        # Also fixed Thai shop-identity text - same reasoning as f_bold above.
         address_font = fit_font(draw, address_text, label_w_px - 2 * x, 15, bold=False, min_size=12)
         draw_thai_text(draw, (x, y), address_text, address_font, fill=0)
         if phone:
@@ -552,15 +675,17 @@ def build_label_image(data, settings):
     y += 10
 
     def field(label, value, yy, label_font=f_normal, start_size=30, right_margin=0):
+        # value is free-typed (patient name / drug name) - pick its font by
+        # inspecting the actual characters, not the label-language dropdown.
         draw_thai_text(draw, (x, yy), label, label_font, fill=0)
         lw = draw.textlength(label, font=label_font)
         value_x = x + lw + 10
         max_w = label_w_px - x - right_margin - value_x
-        value_font = fit_font(draw, value or "", max_w, start_size, bold=True)
+        value_font = fit_font(draw, value or "", max_w, start_size, bold=True, lang=detect_font_lang(value))
         draw_thai_text(draw, (value_x, yy - 3), value or "", value_font, fill=0)
 
     QTY_RESERVED_W = 150
-    field("Patient" if lang == "en" else "ชื่อผู้ป่วย", data["patient_name"], y, right_margin=QTY_RESERVED_W + 10)
+    field(ls("patient_label", "ชื่อผู้ป่วย"), data["patient_name"], y, right_margin=QTY_RESERVED_W + 10)
     qty_x = label_w_px - x - QTY_RESERVED_W
     label_qty = (data.get("label_qty") or "").strip()
     if not label_qty.isdigit():
@@ -571,25 +696,27 @@ def build_label_image(data, settings):
         # handwrite it in.
         draw_thai_text(draw, (qty_x, y), f"#{label_qty}", f_label_big, fill=0)
     else:
-        dotted_field("Qty" if lang == "en" else "จำนวน", qty_x, y, QTY_RESERVED_W)
+        dotted_field(ls("qty_label", "จำนวน"), qty_x, y, QTY_RESERVED_W)
     y += 34
-    field("Drug" if lang == "en" else "ชื่อยา", data["drug1"], y)
+    field(ls("drug_label", "ชื่อยา"), data["drug1"], y)
     y += 32
-    field("Generic Name" if lang == "en" else "ชื่อยาสามัญ", data["drug2"], y)
+    field(ls("generic_label", "ชื่อยาสามัญ"), data["drug2"], y)
     y += 36
 
     if data.get("note"):
-        note_font = fit_font(draw, data["note"], label_w_px - 2 * x, 22, bold=False, min_size=16)
+        # note is free-typed (indication/instructions) - same auto-detect
+        # reasoning as patient_name/drug1/drug2 in field() above.
+        note_font = fit_font(draw, data["note"], label_w_px - 2 * x, 22, bold=False, min_size=16, lang=detect_font_lang(data["note"]))
         draw_thai_text(draw, (x, y), data["note"], note_font, fill=0)
         y += 28
 
     dose_text, line2 = compute_dose_lines(data)
 
-    dose_font = fit_font(draw, dose_text, label_w_px - 2 * x, 26, bold=True)
+    dose_font = fit_font(draw, dose_text, label_w_px - 2 * x, 26, bold=True, lang=lang)
     draw_thai_text(draw, (x, y), dose_text, dose_font, fill=0)
     y += 38
 
-    line2_font = fit_font(draw, line2, label_w_px - 2 * x - QTY_RESERVED_W - 10, 24, bold=True)
+    line2_font = fit_font(draw, line2, label_w_px - 2 * x - QTY_RESERVED_W - 10, 24, bold=True, lang=lang)
     draw_thai_text(draw, (x, y), line2, line2_font, fill=0)
     exp_x = label_w_px - x - QTY_RESERVED_W
     exp_date = (data.get("exp_date") or "").strip()
@@ -602,18 +729,18 @@ def build_label_image(data, settings):
     extra = _tr_extra_labels(data.get("extra_labels"), lang)
     if extra:
         extra_text = " ".join(f"**{e}**" for e in extra)
-        extra_font = fit_font(draw, extra_text, label_w_px - 2 * x, 24, bold=True)
+        extra_font = fit_font(draw, extra_text, label_w_px - 2 * x, 24, bold=True, lang=lang)
         draw_thai_text(draw, (x, y), extra_text, extra_font, fill=0)
         y += 40
 
     draw.line([(x, y), (label_w_px - x, y)], fill=0, width=1)
     y += 16
-    if lang == "en":
+    if lang in ("en", "mm"):
         # This line auto-shrinks via fit_font below to always leave room for
         # the allergy-status text flush right on the same line - no fixed
         # length limit needed here.
-        warning_text = "Inform Pharmacist: drug allergy, pregnancy, breastfeeding, med condition"
-        align_marker = "breastfeeding,"
+        warning_text = ls("warning_text", "")
+        align_marker = ls("align_marker", "")
     else:
         warning_text = "แพ้ยา มีโรคประจำตัว ตั้งครรภ์ ให้นมบุตร โปรดแจ้งเภสัชกร"
         align_marker = "ให้นมบุตร"
@@ -623,20 +750,20 @@ def build_label_image(data, settings):
     # rather than drawing warning_text at a fixed size first and hoping the
     # status text still fits next to it (that's how a too-long English
     # phrase used to overlap the status text - see git history).
-    no_allergy_text = "No known allergy" if lang == "en" else "ไม่แพ้ยา"
-    see_file_text = "Allergy: see file" if lang == "en" else "แพ้ยา:ดูแฟ้ม"
+    no_allergy_text = ls("no_allergy_text", "ไม่แพ้ยา")
+    see_file_text = ls("see_file_text", "แพ้ยา:ดูแฟ้ม")
     if not data.get("has_allergy"):
         status_text = no_allergy_text
     else:
         allergy_drug_name = (data.get("allergy_drug_name") or "").strip()
         status_text = (
-            (f"Allergy: {allergy_drug_name}" if lang == "en" else f"แพ้ยา:{allergy_drug_name}")
+            (f"{ls('allergy_prefix', 'แพ้ยา:')}{allergy_drug_name}")
             if allergy_drug_name else see_file_text
         )
 
     STATUS_RESERVED_W = 160
     warning_font = fit_font(
-        draw, warning_text, label_w_px - 2 * x - STATUS_RESERVED_W, 18, min_size=11,
+        draw, warning_text, label_w_px - 2 * x - STATUS_RESERVED_W, 18, min_size=11, lang=lang,
     )
     draw_thai_text(draw, (x, y), warning_text, warning_font, fill=0)
 
@@ -646,7 +773,7 @@ def build_label_image(data, settings):
         # Even the generic fallback text doesn't fit the reserved space at
         # this label size - shrink it too rather than let it run off the
         # edge of the sticker.
-        status_font = fit_font(draw, status_text, STATUS_RESERVED_W - 10, 18, min_size=11)
+        status_font = fit_font(draw, status_text, STATUS_RESERVED_W - 10, 18, min_size=11, lang=lang)
         status_w = draw.textlength(status_text, font=status_font)
     status_x = label_w_px - x - status_w
     draw_thai_text(draw, (status_x, y), status_text, status_font, fill=0)
@@ -657,13 +784,21 @@ def build_label_image(data, settings):
     # pharmacist name on its own row below the warning line, starting at the
     # same x as align_marker on the line above - needs the extra width for
     # pharmacists who want full name + surname + license number
+    # pharm_label is per-language translated text (drawn with the lang-aware
+    # font); pharmacist_names is fixed Thai shop-config text (always drawn
+    # with the Thai/Latin-capable font, same reasoning as f_bold/
+    # address_font above) - two separate draw calls since mmrtext.ttf has
+    # no Thai glyphs to render pharmacist_names with on a Burmese label.
     pharmacist_names = settings.get("pharmacist_names") or ""
-    pharm_label = "Pharmacist" if lang == "en" else "เภสัชกร"
-    pharm_text = f"{pharm_label}: {pharmacist_names}" if pharmacist_names else ""
-    if pharm_text:
-        pharm_font = find_font(18)  # 15 * 1.2
+    pharm_label = ls("pharm_label", "เภสัชกร")
+    if pharmacist_names:
+        pharm_label_text = f"{pharm_label}: "
+        pharm_font = find_font(18, lang=lang)  # 15 * 1.2
+        pharm_name_font = find_font(18)  # always Thai/Latin-capable
         prefix_w = draw.textlength(warning_text.split(align_marker)[0], font=warning_font)
-        draw_thai_text(draw, (x + prefix_w, y), pharm_text, pharm_font, fill=0)
+        draw_thai_text(draw, (x + prefix_w, y), pharm_label_text, pharm_font, fill=0)
+        label_w = draw.textlength(pharm_label_text, font=pharm_font)
+        draw_thai_text(draw, (x + prefix_w + label_w, y), pharmacist_names, pharm_name_font, fill=0)
 
     return img
 
