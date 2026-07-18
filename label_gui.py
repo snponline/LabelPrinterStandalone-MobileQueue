@@ -59,6 +59,40 @@ DOTS_PER_MM = 8  # matches standard 203dpi thermal label printers
 TIME_OPTIONS = storage.TIME_OPTIONS  # เช้า/เที่ยง/เย็น/ก่อนนอน
 UNIT_OPTIONS = ["เม็ด", "แคปซูล", "ช้อนชา", "ช้อนโต๊ะ", "ซอง", "ml", "หยด", "พ่น"]
 
+# Per-label language - chosen at print time (row dropdown, default "th"),
+# not a per-drug/global setting, since a shop's customers are often mixed
+# nationality and the right language varies visit to visit. Only the FIXED
+# template wording (field labels, dose phrasing, warning line) is
+# translated here - drug names/notes/extra_labels are whatever the
+# pharmacist actually typed and are never auto-translated (medical-accuracy
+# risk), so English/Burmese output still needs those typed in that language.
+LABEL_LANGS = ["th", "en"]
+LABEL_LANG_NAMES = {"th": "ไทย", "en": "English"}
+TIME_EN = {"เช้า": "Morning", "เที่ยง": "Noon", "เย็น": "Evening", "ก่อนนอน": "Before bed"}
+MEAL_EN = {"ก่อนอาหาร": "Before meals", "หลังอาหาร": "After meals"}
+UNIT_EN = {
+    "เม็ด": "tab(s)", "แคปซูล": "cap(s)", "ช้อนชา": "tsp(5ml)", "ช้อนโต๊ะ": "tbsp(15ml)",
+    "ซอง": "sachet(s)", "ml": "ml", "หยด": "drop(s)", "พ่น": "spray(s)",
+}
+
+
+def _tr_times(times, lang):
+    if lang != "en":
+        return list(times or [])
+    return [TIME_EN.get(t, t) for t in (times or [])]
+
+
+def _tr_meal(meal, lang):
+    if lang != "en":
+        return meal or ""
+    return MEAL_EN.get(meal, meal or "")
+
+
+def _tr_unit(unit, lang):
+    if lang != "en":
+        return unit or "เม็ด"
+    return UNIT_EN.get(unit, unit or "tab(s)")
+
 EXTRA_LABEL_OPTIONS_BY_MODE = {
     "oral": [
         "ทานยาก่อนอาหาร 1/2-1 ชม",
@@ -347,12 +381,40 @@ def compute_dose_lines(data):
     """Returns (dose_text, line2) - the same wording used on the physical
     label. Shared between build_label_image() (rendering) and the print
     history dialog (showing dosing info on click) so the two can never
-    drift apart."""
+    drift apart. data["lang"] ("th"/"en", default "th") picks which fixed
+    phrasing to use - see LABEL_LANGS above."""
     usage_mode = data.get("usage_mode", "oral")
+    lang = data.get("lang", "th")
+    times = _tr_times(data.get("times"), lang)
+    if lang == "en":
+        if usage_mode == "topical":
+            dose_text = f"Apply thinly, {data.get('per_day') or '__'} time(s)/day"
+            line2 = "  ".join(times)
+            if data.get("every_hr"):
+                line2 += f"   every {data['every_hr']} hr"
+        elif usage_mode == "drops":
+            dose_text = f"{data.get('qty') or '__'} drop(s) per dose"
+            if data.get("per_day"):
+                dose_text += f"   {data['per_day']} time(s)/day"
+            line2 = "  ".join(times)
+            if data.get("every_hr"):
+                line2 += f"   every {data['every_hr']} hr"
+        else:
+            unit = _tr_unit(data.get("unit"), lang)
+            dose_text = f"Take {data.get('qty') or '__'} {unit} per dose"
+            if data.get("per_day"):
+                dose_text += f"   {data['per_day']} time(s)/day"
+            line2 = _tr_meal(data.get("meal"), lang)
+            if times:
+                line2 += ("    " if line2 else "") + "  ".join(times)
+            if data.get("every_hr"):
+                line2 += f"   every {data['every_hr']} hr"
+        return dose_text, line2
+
     if usage_mode == "topical":
         # ยาทา: no unit/meal - "ทาบางๆ วันละ N ครั้ง" then times/every_hr only
         dose_text = f"ทาบางๆ วันละ {data.get('per_day') or '__'} ครั้ง"
-        line2 = "  ".join(data.get("times") or [])
+        line2 = "  ".join(times)
         if data.get("every_hr"):
             line2 += f"   ทุก {data['every_hr']} ชม."
     elif usage_mode == "drops":
@@ -360,7 +422,7 @@ def compute_dose_lines(data):
         dose_text = f"หยอดครั้งละ {data.get('qty') or '__'} หยด"
         if data.get("per_day"):
             dose_text += f"   วันละ {data['per_day']} ครั้ง"
-        line2 = "  ".join(data.get("times") or [])
+        line2 = "  ".join(times)
         if data.get("every_hr"):
             line2 += f"   ทุก {data['every_hr']} ชม."
     else:
@@ -369,8 +431,8 @@ def compute_dose_lines(data):
         if data.get("per_day"):
             dose_text += f"   วันละ {data['per_day']} ครั้ง"
         line2 = data.get("meal") or ""
-        if data.get("times"):
-            line2 += ("    " if line2 else "") + "  ".join(data["times"])
+        if times:
+            line2 += ("    " if line2 else "") + "  ".join(times)
         if data.get("every_hr"):
             line2 += f"   ทุก {data['every_hr']} ชม."
     return dose_text, line2
@@ -389,7 +451,38 @@ def split_allergy_items(note):
     return [p.strip() for p in parts if p.strip()]
 
 
+# ฉลากเสริม (extra_labels) is chosen from a small fixed preset list per
+# usage mode (see EXTRA_LABEL_OPTIONS_BY_MODE) plus one free-typed "อื่นๆ"
+# slot - so unlike drug1/drug2/note (genuinely free text, left as typed in
+# whatever language on an English label - drug/generic names are usually
+# already Latin script anyway, and the pharmacist explains indications
+# verbally), the preset phrases can just be hardcoded translations, no AI
+# needed. A custom free-typed extra label has no entry here and prints
+# as-is, same as drug1/drug2/note.
+EXTRA_LABEL_EN = {
+    "ทานยาก่อนอาหาร 1/2-1 ชม": "Take 30-60 min before meals",
+    "ทานยาหลังอาหารทันที": "Take right after meals",
+    "ทานติดต่อกันจนหมด": "Complete the full course",
+    "ดื่มน้ำตามมากๆ": "Drink plenty of water",
+    "ยานี้อาจทำให้ง่วงซึม": "May cause drowsiness",
+    "ห้ามรับประทานพร้อมนม ยาลดกรด": "Avoid with milk/antacids",
+    "ทานเมื่อมีอาการ": "Take as needed",
+    "หายแล้ว ทาต่ออีก 1 สัปดาห์": "Continue 1 week after healing",
+    "ทาต่อเนื่อง 2 สัปดาห์": "Apply continuously for 2 weeks",
+    "หยดเมื่อมีอาการ": "Use as needed",
+    "หยดต่อเนื่อง 2 สัปดาห์": "Use continuously for 2 weeks",
+    "ยาหยอดตาใช้ได้ 3 เดือน": "Discard 3 months after opening",
+}
+
+
+def _tr_extra_labels(extra_labels, lang):
+    if lang != "en":
+        return list(extra_labels or [])
+    return [EXTRA_LABEL_EN.get(e, e) for e in (extra_labels or [])]
+
+
 def build_label_image(data, settings):
+    lang = data.get("lang", "th")
     label_w_px = int(settings["label_w_mm"]) * DOTS_PER_MM
     label_h_px = int(settings["label_h_mm"]) * DOTS_PER_MM
 
@@ -417,8 +510,12 @@ def build_label_image(data, settings):
     draw_thai_text(draw, (x, y), company_name, f_bold, fill=0)
 
     DATE_RESERVED_W = 180
-    today_str = datetime.now().strftime("%d/%m/") + str(datetime.now().year + 543)
-    date_label = "วันที่"
+    if lang == "en":
+        today_str = datetime.now().strftime("%d/%m/%Y")
+        date_label = "Date"
+    else:
+        today_str = datetime.now().strftime("%d/%m/") + str(datetime.now().year + 543)
+        date_label = "วันที่"
     date_x = label_w_px - x - DATE_RESERVED_W
     draw_thai_text(draw, (date_x, y + 4), date_label, f_label_big, fill=0)
     date_lw = draw.textlength(date_label, font=f_label_big)
@@ -447,7 +544,7 @@ def build_label_image(data, settings):
         draw_thai_text(draw, (value_x, yy - 3), value or "", value_font, fill=0)
 
     QTY_RESERVED_W = 150
-    field("ชื่อผู้ป่วย", data["patient_name"], y, right_margin=QTY_RESERVED_W + 10)
+    field("Patient" if lang == "en" else "ชื่อผู้ป่วย", data["patient_name"], y, right_margin=QTY_RESERVED_W + 10)
     qty_x = label_w_px - x - QTY_RESERVED_W
     label_qty = (data.get("label_qty") or "").strip()
     if not label_qty.isdigit():
@@ -458,11 +555,11 @@ def build_label_image(data, settings):
         # handwrite it in.
         draw_thai_text(draw, (qty_x, y), f"#{label_qty}", f_label_big, fill=0)
     else:
-        dotted_field("จำนวน", qty_x, y, QTY_RESERVED_W)
+        dotted_field("Qty" if lang == "en" else "จำนวน", qty_x, y, QTY_RESERVED_W)
     y += 34
-    field("ชื่อยา", data["drug1"], y)
+    field("Drug" if lang == "en" else "ชื่อยา", data["drug1"], y)
     y += 32
-    field("ชื่อยาสามัญ", data["drug2"], y)
+    field("Generic Name" if lang == "en" else "ชื่อยาสามัญ", data["drug2"], y)
     y += 36
 
     if data.get("note"):
@@ -486,7 +583,7 @@ def build_label_image(data, settings):
         dotted_field("EXP", exp_x, y + 4, QTY_RESERVED_W)
     y += 40
 
-    extra = data.get("extra_labels") or []
+    extra = _tr_extra_labels(data.get("extra_labels"), lang)
     if extra:
         extra_text = " ".join(f"**{e}**" for e in extra)
         extra_font = fit_font(draw, extra_text, label_w_px - 2 * x, 24, bold=True)
@@ -495,39 +592,61 @@ def build_label_image(data, settings):
 
     draw.line([(x, y), (label_w_px - x, y)], fill=0, width=1)
     y += 16
-    warning_text = "แพ้ยา มีโรคประจำตัว ตั้งครรภ์ ให้นมบุตร โปรดแจ้งเภสัชกร"
-    draw_thai_text(draw, (x, y), warning_text, f_medium, fill=0)
+    if lang == "en":
+        # This line auto-shrinks via fit_font below to always leave room for
+        # the allergy-status text flush right on the same line - no fixed
+        # length limit needed here.
+        warning_text = "Inform Pharmacist: drug allergy, pregnancy, breastfeeding, med condition"
+        align_marker = "breastfeeding,"
+    else:
+        warning_text = "แพ้ยา มีโรคประจำตัว ตั้งครรภ์ ให้นมบุตร โปรดแจ้งเภสัชกร"
+        align_marker = "ให้นมบุตร"
 
-    # allergy status - flush right on the same line, underlined so it stands
-    # out from the generic warning text next to it. If the patient has
-    # exactly one known drug allergy, print its name directly instead of the
-    # generic "ดูแฟ้ม" (see-file) notice - but only if it actually fits next
-    # to warning_text without overlapping; otherwise fall back to "ดูแฟ้ม"
-    # the same as when there are multiple/unknown allergies.
+    # allergy status text - decided before laying out warning_text so the
+    # warning line's font can be shrunk to always leave it enough room,
+    # rather than drawing warning_text at a fixed size first and hoping the
+    # status text still fits next to it (that's how a too-long English
+    # phrase used to overlap the status text - see git history).
+    no_allergy_text = "No known allergy" if lang == "en" else "ไม่แพ้ยา"
+    see_file_text = "Allergy: see file" if lang == "en" else "แพ้ยา:ดูแฟ้ม"
     if not data.get("has_allergy"):
-        status_text = "ไม่แพ้ยา"
+        status_text = no_allergy_text
     else:
         allergy_drug_name = (data.get("allergy_drug_name") or "").strip()
-        status_text = f"แพ้ยา:{allergy_drug_name}" if allergy_drug_name else "แพ้ยา:ดูแฟ้ม"
-        warning_w = draw.textlength(warning_text, font=f_medium)
-        status_w = draw.textlength(status_text, font=f_medium)
-        if status_w > label_w_px - 2 * x - warning_w - 10:
-            status_text = "แพ้ยา:ดูแฟ้ม"
-    status_w = draw.textlength(status_text, font=f_medium)
+        status_text = (
+            (f"Allergy: {allergy_drug_name}" if lang == "en" else f"แพ้ยา:{allergy_drug_name}")
+            if allergy_drug_name else see_file_text
+        )
+
+    STATUS_RESERVED_W = 160
+    warning_font = fit_font(
+        draw, warning_text, label_w_px - 2 * x - STATUS_RESERVED_W, 18, min_size=11,
+    )
+    draw_thai_text(draw, (x, y), warning_text, warning_font, fill=0)
+
+    status_font = f_medium
+    status_w = draw.textlength(status_text, font=status_font)
+    if status_w > STATUS_RESERVED_W - 10:
+        # Even the generic fallback text doesn't fit the reserved space at
+        # this label size - shrink it too rather than let it run off the
+        # edge of the sticker.
+        status_font = fit_font(draw, status_text, STATUS_RESERVED_W - 10, 18, min_size=11)
+        status_w = draw.textlength(status_text, font=status_font)
     status_x = label_w_px - x - status_w
-    draw_thai_text(draw, (status_x, y), status_text, f_medium, fill=0)
+    draw_thai_text(draw, (status_x, y), status_text, status_font, fill=0)
     underline_y = y + 18
     draw.line([(status_x, underline_y), (status_x + status_w, underline_y)], fill=0, width=1)
     y += 22
 
     # pharmacist name on its own row below the warning line, starting at the
-    # same x as "ให้นมบุตร" on the line above - needs the extra width for
+    # same x as align_marker on the line above - needs the extra width for
     # pharmacists who want full name + surname + license number
     pharmacist_names = settings.get("pharmacist_names") or ""
-    pharm_text = f"เภสัชกร: {pharmacist_names}" if pharmacist_names else ""
+    pharm_label = "Pharmacist" if lang == "en" else "เภสัชกร"
+    pharm_text = f"{pharm_label}: {pharmacist_names}" if pharmacist_names else ""
     if pharm_text:
         pharm_font = find_font(18)  # 15 * 1.2
-        prefix_w = draw.textlength(warning_text.split("ให้นมบุตร")[0], font=f_medium)
+        prefix_w = draw.textlength(warning_text.split(align_marker)[0], font=warning_font)
         draw_thai_text(draw, (x + prefix_w, y), pharm_text, pharm_font, fill=0)
 
     return img
@@ -1227,6 +1346,7 @@ class LabelApp:
                 "print_qty": 1,
                 "exp_date": info.get("exp_date", ""),
                 "label_qty": info.get("label_qty", ""),
+                "lang": "th",
             }
         else:
             entry = {
@@ -1241,6 +1361,7 @@ class LabelApp:
                 "print_qty": 1,
                 "exp_date": (info.get("exp_date", "") if info else ""),
                 "label_qty": (info.get("label_qty", "") if info else ""),
+                "lang": "th",
             }
         self.selected_drugs.append(entry)
         self.refresh_selected_list()
@@ -1256,7 +1377,7 @@ class LabelApp:
             "idproduct": None, "drug1": "", "drug2": "", "note": "", "qty": "",
             "unit": "เม็ด", "per_day": "", "every_hr": "", "meal": "หลังอาหาร",
             "times": [], "extra_labels": [], "usage_mode": "oral", "barcode": "",
-            "status": "missing", "print_qty": 1, "exp_date": "", "label_qty": "",
+            "status": "missing", "print_qty": 1, "exp_date": "", "label_qty": "", "lang": "th",
         }
         self.selected_drugs.append(entry)
         index = len(self.selected_drugs) - 1
@@ -1430,6 +1551,23 @@ class LabelApp:
 
             label_qty_var.trace_add("write", on_label_qty_change)
             tk.Entry(row, textvariable=label_qty_var, width=5, font=("Tahoma", fs(10)), justify="center").pack(side="left", padx=fs(2))
+
+            # Per-label language, chosen at print time (not remembered per
+            # drug) - a shop's walk-in customers are often mixed
+            # nationality, so the right language varies visit to visit, not
+            # by drug. Default "ไทย" every time. See LABEL_LANGS.
+            lang_var = tk.StringVar(value=LABEL_LANG_NAMES.get(d.get("lang", "th"), "ไทย"))
+            lang_names_to_code = {v: k for k, v in LABEL_LANG_NAMES.items()}
+
+            def on_lang_change(event=None, idx=i, var=lang_var):
+                self.selected_drugs[idx]["lang"] = lang_names_to_code.get(var.get(), "th")
+
+            lang_combo = ttk.Combobox(
+                row, textvariable=lang_var, values=list(LABEL_LANG_NAMES.values()),
+                state="readonly", font=("Tahoma", fs(9)), width=7,
+            )
+            lang_combo.pack(side="left", padx=(fs(6), fs(2)))
+            lang_combo.bind("<<ComboboxSelected>>", on_lang_change)
 
             tk.Label(row, text="#ฉลาก", font=("Tahoma", fs(10))).pack(side="left", padx=(fs(6), fs(2)))
             qty_var = tk.StringVar(value=str(d.get("print_qty", 1)))
