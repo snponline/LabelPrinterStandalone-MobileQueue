@@ -146,12 +146,50 @@ def _connect():
         CREATE TABLE IF NOT EXISTS patient_documents (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             patient_id INTEGER NOT NULL,
-            image_path TEXT NOT NULL,
+            image_path TEXT,
             note TEXT,
             uploaded_at TEXT NOT NULL
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_patient_documents_patient ON patient_documents(patient_id)")
+    # body_text - for saving a text note or an AI/patient chat transcript
+    # (title + body_text, no image needed), not just a photo + short
+    # caption. "note" is reused as the short title shown in the document
+    # list. image_path was NOT NULL originally - existing installs need it
+    # relaxed to allow text-only documents (SQLite can't ALTER a column's
+    # NOT NULL constraint directly, so this rebuilds the table).
+    existing_doc_cols = {row[1] for row in conn.execute("PRAGMA table_info(patient_documents)")}
+    if "body_text" not in existing_doc_cols:
+        conn.execute("ALTER TABLE patient_documents ADD COLUMN body_text TEXT")
+    image_path_col = next(
+        (row for row in conn.execute("PRAGMA table_info(patient_documents)") if row[1] == "image_path"), None
+    )
+    if image_path_col is not None and image_path_col[3]:  # notnull flag
+        # DROP+INSERT+RENAME below is a real transaction (unlike the
+        # CREATE/ALTER/INDEX statements elsewhere in this function, which
+        # auto-commit individually) - must be committed explicitly, and a
+        # leftover _new table from a previous run that died mid-migration
+        # (e.g. process killed before the commit) must be cleared first so
+        # this doesn't crash with "table already exists" on retry.
+        conn.execute("DROP TABLE IF EXISTS patient_documents_new")
+        conn.execute("""
+            CREATE TABLE patient_documents_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                patient_id INTEGER NOT NULL,
+                image_path TEXT,
+                note TEXT,
+                uploaded_at TEXT NOT NULL,
+                body_text TEXT
+            )
+        """)
+        conn.execute(
+            "INSERT INTO patient_documents_new (id, patient_id, image_path, note, uploaded_at, body_text) "
+            "SELECT id, patient_id, image_path, note, uploaded_at, body_text FROM patient_documents"
+        )
+        conn.execute("DROP TABLE patient_documents")
+        conn.execute("ALTER TABLE patient_documents_new RENAME TO patient_documents")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_patient_documents_patient ON patient_documents(patient_id)")
+        conn.commit()
     return conn
 
 
@@ -641,6 +679,45 @@ def list_print_jobs(hours=24):
         conn.close()
 
 
+def search_patient_name_suggestions(term, limit=10):
+    """Prefix/contains match across BOTH patients (ประวัติผู้ป่วย) and
+    print_jobs (ประวัติการจ่ายยา) - a person may exist in one but not the
+    other (printed without ever being explicitly saved to a patient
+    profile, or a patient profile created before any print). Used for the
+    live autocomplete suggestions in open_patient_dialog()'s name entry, so
+    typing a few letters is enough instead of the full name every time."""
+    term = (term or "").strip()
+    if not term:
+        return []
+    seen = set()
+    results = []
+    try:
+        for p in search_patients(term, limit=limit):
+            key = (p["name"], p["phone"])
+            if key in seen:
+                continue
+            seen.add(key)
+            results.append({"name": p["name"], "phone": p["phone"]})
+    except Exception:
+        pass
+    if len(results) < limit:
+        try:
+            for j in search_print_jobs(term, limit=30):
+                name = (j.get("patient_name") or "").strip()
+                if not name:
+                    continue
+                key = (name, j.get("customer_phone") or "")
+                if key in seen:
+                    continue
+                seen.add(key)
+                results.append({"name": name, "phone": j.get("customer_phone") or ""})
+                if len(results) >= limit:
+                    break
+        except Exception:
+            pass
+    return results[:limit]
+
+
 def search_print_jobs(term, limit=200):
     """Search the ENTIRE history (no time cutoff) by patient name or phone -
     for "have we dispensed anything to this person before, and what/when".
@@ -985,22 +1062,31 @@ def _resize_image_bytes(image_bytes, max_side=800):
     return out.getvalue()
 
 
-def add_patient_document(patient_id, image_bytes, note):
+def add_patient_document(patient_id, title, body_text, image_bytes=None):
     """Resizes to at most 800px on the longest side before saving (storage
     space, not just display) - documents are stored as files on disk under
     PATIENT_DOCS_DIR, not as DB blobs, so the sqlite file itself stays small
-    and the mobile page can serve them as plain static files."""
-    patient_dir = os.path.join(PATIENT_DOCS_DIR, str(patient_id))
-    os.makedirs(patient_dir, exist_ok=True)
-    resized = _resize_image_bytes(image_bytes)
-    filename = f"{uuid.uuid4().hex}.jpg"
-    with open(os.path.join(patient_dir, filename), "wb") as f:
-        f.write(resized)
+    and the mobile page can serve them as plain static files.
+
+    image_bytes is optional - this originally only supported a photo + short
+    caption ("note"), but is also used to save a text note or an AI/patient
+    chat transcript (title + body_text, no image needed) - see
+    open_patient_profile_dialog()'s upload_doc() in label_gui.py. "note" is
+    reused as the short title shown in the document list."""
+    filename = None
+    if image_bytes:
+        patient_dir = os.path.join(PATIENT_DOCS_DIR, str(patient_id))
+        os.makedirs(patient_dir, exist_ok=True)
+        resized = _resize_image_bytes(image_bytes)
+        filename = f"{uuid.uuid4().hex}.jpg"
+        with open(os.path.join(patient_dir, filename), "wb") as f:
+            f.write(resized)
     conn = _connect()
     try:
         conn.execute(
-            "INSERT INTO patient_documents (patient_id, image_path, note, uploaded_at) VALUES (?, ?, ?, ?)",
-            (patient_id, filename, note or "", datetime.now().isoformat()),
+            "INSERT INTO patient_documents (patient_id, image_path, note, uploaded_at, body_text) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (patient_id, filename, title or "", datetime.now().isoformat(), body_text or ""),
         )
         conn.commit()
     finally:
@@ -1017,11 +1103,33 @@ def list_patient_documents(patient_id):
         ).fetchall()
         return [
             {
-                "id": r[0], "image_path": r[1], "note": r[2] or "", "uploaded_at": r[3],
-                "full_path": os.path.join(PATIENT_DOCS_DIR, str(patient_id), r[1]),
+                "id": r[0], "title": r[2] or "", "uploaded_at": r[3],
+                "has_image": bool(r[1]),
+                "full_path": os.path.join(PATIENT_DOCS_DIR, str(patient_id), r[1]) if r[1] else None,
             }
             for r in rows
         ]
+    finally:
+        conn.close()
+
+
+def get_patient_document(doc_id):
+    """Full record (title + body text + resolved image path if any) for the
+    view popup."""
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT patient_id, image_path, note, uploaded_at, body_text FROM patient_documents WHERE id = ?",
+            (doc_id,),
+        ).fetchone()
+        if not row:
+            return None
+        patient_id, image_path, note, uploaded_at, body_text = row
+        return {
+            "title": note or "", "body_text": body_text or "", "uploaded_at": uploaded_at,
+            "has_image": bool(image_path),
+            "full_path": os.path.join(PATIENT_DOCS_DIR, str(patient_id), image_path) if image_path else None,
+        }
     finally:
         conn.close()
 

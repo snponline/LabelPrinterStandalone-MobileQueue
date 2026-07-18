@@ -386,47 +386,6 @@ def draw_thai_text(draw, xy, text, font, fill=0):
         i += 1
 
 
-def ask_upload_note(parent):
-    """Bigger note-entry dialog for patient document uploads (replaces
-    simpledialog.askstring, whose fixed small entry/font was hard to use
-    for longer notes). Returns the note string, or None if cancelled."""
-    win = tk.Toplevel(parent)
-    win.title("หมายเหตุ")
-    win.transient(parent)
-    win.grab_set()
-
-    result = {"value": None}
-
-    tk.Label(
-        win, text="ใส่หมายเหตุ (ถ้ามี) แล้วกด OK เพื่ออัปโหลด:",
-        font=("Tahoma", fs(20)), anchor="w",
-    ).pack(fill="x", padx=fs(12), pady=(fs(12), fs(6)))
-
-    text_box = tk.Text(win, font=("Tahoma", fs(20)), width=45, height=9, wrap="word")
-    text_box.pack(fill="both", expand=True, padx=fs(12), pady=(0, fs(10)))
-    text_box.focus_set()
-
-    def on_ok(event=None):
-        result["value"] = text_box.get("1.0", "end-1c").strip()
-        win.destroy()
-
-    def on_cancel(event=None):
-        result["value"] = None
-        win.destroy()
-
-    btn_row = tk.Frame(win)
-    btn_row.pack(fill="x", padx=fs(12), pady=(0, fs(12)))
-    tk.Button(btn_row, text="OK", font=("Tahoma", fs(11)), width=10, command=on_ok).pack(side="right", padx=(fs(6), 0))
-    tk.Button(btn_row, text="Cancel", font=("Tahoma", fs(11)), width=10, command=on_cancel).pack(side="right")
-
-    win.protocol("WM_DELETE_WINDOW", on_cancel)
-    win.bind("<Escape>", on_cancel)
-    win.update_idletasks()
-    win.minsize(win.winfo_width(), win.winfo_height())
-    win.wait_window()
-    return result["value"]
-
-
 def compute_dose_lines(data):
     """Returns (dose_text, line2) - the same wording used on the physical
     label. Shared between build_label_image() (rendering) and the print
@@ -3149,7 +3108,10 @@ class LabelApp:
         win_y = max(0, (win.winfo_screenheight() - win_h) // 2 - fs(20))
         win.geometry(f"{win_w}x{win_h}+{win_x}+{win_y}")
         win.transient(self.root)
-        win.grab_set()
+        # No grab_set() - deliberately non-modal, so this can stay open at
+        # the same time as "AI ช่วยค้นข้อมูล" and the two can be switched
+        # between freely (e.g. to copy AI conversation text and paste it
+        # into a patient document without closing this window first).
 
         tk.Label(win, text="ค้นหาชื่อ/เบอร์โทร", font=("Tahoma", fs(10), "bold")).pack(anchor="w", padx=fs(10), pady=(fs(10), fs(2)))
         search_row = tk.Frame(win)
@@ -3196,9 +3158,9 @@ class LabelApp:
 
         doc_header_row = tk.Frame(win)
         doc_header_row.pack(fill="x", padx=fs(10))
-        tk.Label(doc_header_row, text="เอกสารประกอบ (รูป+หมายเหตุ)", font=("Tahoma", fs(10), "bold")).pack(side="left")
+        tk.Label(doc_header_row, text="เอกสารประกอบ (บันทึก/บทสนทนา/รูป)", font=("Tahoma", fs(10), "bold")).pack(side="left")
         tk.Button(
-            doc_header_row, text="📷 เพิ่มรูป+หมายเหตุ", font=("Tahoma", fs(8), "bold"), bg="#1a5a9a", fg="white",
+            doc_header_row, text="📝 เพิ่มบันทึก", font=("Tahoma", fs(8), "bold"), bg="#1a5a9a", fg="white",
             command=lambda: upload_doc(),
         ).pack(side="right")
 
@@ -3311,11 +3273,12 @@ class LabelApp:
                 return
             for d in docs:
                 when = format_when(d["uploaded_at"])
-                note_part = f" - {d['note']}" if d["note"] else ""
+                title_part = f" - {d['title']}" if d["title"] else ""
+                img_mark = " 📷" if d.get("has_image") else ""
                 row = tk.Frame(doc_rows_frame)
                 row.pack(fill="x", padx=fs(4), pady=fs(2))
                 tk.Label(
-                    row, text=f"{when}{note_part}", font=("Tahoma", fs(9)),
+                    row, text=f"{when}{title_part}{img_mark}", font=("Tahoma", fs(9)),
                     anchor="w", justify="left", wraplength=fs(320),
                 ).pack(side="left", fill="x", expand=True)
                 tk.Button(
@@ -3331,29 +3294,144 @@ class LabelApp:
             if not current_patient["id"]:
                 messagebox.showwarning("แจ้งเตือน", "กรุณาค้นหา/เลือกผู้ป่วยก่อน", parent=win)
                 return
-            path = filedialog.askopenfilename(
-                title="เลือกรูปภาพ", parent=win,
-                filetypes=[("Image files", "*.jpg *.jpeg *.png *.bmp *.gif")],
+
+            add_win = tk.Toplevel(win)
+            add_win.title("เพิ่มบันทึก")
+            add_win.transient(win)
+            # No grab_set() - same reasoning as open_ai_assist_dialog/
+            # open_patient_profile_dialog: this needs to stay switchable
+            # with the AI window open at the same time, to copy conversation
+            # text over without closing this dialog first.
+
+            tk.Label(add_win, text="หัวเรื่อง", font=("Tahoma", fs(10), "bold")).pack(
+                anchor="w", padx=fs(12), pady=(fs(12), fs(2))
             )
-            if not path:
-                return
-            note = ask_upload_note(win)
-            if note is None:
-                return
-            try:
-                with open(path, "rb") as f:
-                    image_bytes = f.read()
-                storage.add_patient_document(current_patient["id"], image_bytes, note)
-            except Exception as e:
-                messagebox.showerror("อัปโหลดไม่สำเร็จ", str(e), parent=win)
-                return
-            refresh_documents()
+            title_var = tk.StringVar()
+            tk.Entry(add_win, textvariable=title_var, font=("Tahoma", fs(10)), width=48).pack(
+                fill="x", padx=fs(12)
+            )
+
+            tk.Label(
+                add_win, text="เนื้อหา (เช่น บทสนทนากับ AI/คนไข้ - ไม่บังคับ)", font=("Tahoma", fs(10), "bold"),
+            ).pack(anchor="w", padx=fs(12), pady=(fs(8), fs(2)))
+            body_box = tk.Text(add_win, font=("Tahoma", fs(10)), width=52, height=14, wrap="word")
+            body_box.pack(fill="both", expand=True, padx=fs(12))
+
+            image_state = {"path": None}
+            image_status_var = tk.StringVar(value="(ไม่มีรูปแนบ)")
+
+            def pick_image():
+                path = filedialog.askopenfilename(
+                    title="เลือกรูปภาพ", parent=add_win,
+                    filetypes=[("Image files", "*.jpg *.jpeg *.png *.bmp *.gif")],
+                )
+                if path:
+                    image_state["path"] = path
+                    image_status_var.set(os.path.basename(path))
+
+            img_row = tk.Frame(add_win)
+            img_row.pack(fill="x", padx=fs(12), pady=(fs(8), 0))
+            tk.Button(
+                img_row, text="📎 แนบรูป (ถ้ามี)", font=("Tahoma", fs(9)), command=pick_image,
+            ).pack(side="left")
+            tk.Label(
+                img_row, textvariable=image_status_var, font=("Tahoma", fs(9)), fg="#555",
+            ).pack(side="left", padx=(fs(6), 0))
+
+            def do_save():
+                title = title_var.get().strip()
+                if not title:
+                    messagebox.showwarning("แจ้งเตือน", "กรุณาใส่หัวเรื่อง", parent=add_win)
+                    return
+                body_text = body_box.get("1.0", "end-1c").strip()
+                image_bytes = None
+                if image_state["path"]:
+                    try:
+                        with open(image_state["path"], "rb") as f:
+                            image_bytes = f.read()
+                    except Exception as e:
+                        messagebox.showerror("อ่านไฟล์รูปไม่สำเร็จ", str(e), parent=add_win)
+                        return
+                try:
+                    storage.add_patient_document(current_patient["id"], title, body_text, image_bytes)
+                except Exception as e:
+                    messagebox.showerror("บันทึกไม่สำเร็จ", str(e), parent=add_win)
+                    return
+                add_win.destroy()
+                refresh_documents()
+
+            def paste_from_clipboard():
+                try:
+                    clip_text = add_win.clipboard_get()
+                except tk.TclError:
+                    messagebox.showwarning("แจ้งเตือน", "ไม่พบข้อความใน Clipboard", parent=add_win)
+                    return
+                body_box.insert(tk.INSERT, clip_text)
+
+            btn_row = tk.Frame(add_win)
+            btn_row.pack(fill="x", padx=fs(12), pady=(fs(10), fs(12)))
+            tk.Button(
+                btn_row, text="💾 บันทึก", font=("Tahoma", fs(10), "bold"), bg="#1a7a4a", fg="white",
+                command=do_save,
+            ).pack(side="right")
+            tk.Button(
+                btn_row, text="ยกเลิก", font=("Tahoma", fs(10)), command=add_win.destroy,
+            ).pack(side="right", padx=(0, fs(6)))
+            tk.Button(
+                btn_row, text="📋 วางจาก Clipboard", font=("Tahoma", fs(10)), command=paste_from_clipboard,
+            ).pack(side="left")
+
+            add_win.update_idletasks()
+            add_win.minsize(add_win.winfo_width(), add_win.winfo_height())
+            add_win.lift()
+            add_win.focus_force()
 
         def view_doc(d):
             try:
-                os.startfile(d["full_path"])
+                full = storage.get_patient_document(d["id"])
             except Exception as e:
                 messagebox.showerror("เปิดไม่สำเร็จ", str(e), parent=win)
+                return
+            if not full:
+                messagebox.showwarning("แจ้งเตือน", "ไม่พบเอกสารนี้แล้ว", parent=win)
+                return
+
+            view_win = tk.Toplevel(win)
+            view_win.title(full["title"] or "เอกสาร")
+            view_win.transient(win)
+
+            tk.Label(
+                view_win, text=full["title"] or "(ไม่มีหัวเรื่อง)", font=("Tahoma", fs(12), "bold"),
+                wraplength=fs(420), justify="left",
+            ).pack(anchor="w", padx=fs(12), pady=(fs(12), fs(2)))
+            tk.Label(
+                view_win, text=format_when(full["uploaded_at"]), font=("Tahoma", fs(8)), fg="#777",
+            ).pack(anchor="w", padx=fs(12), pady=(0, fs(6)))
+
+            if full["body_text"]:
+                body_box = tk.Text(view_win, font=("Tahoma", fs(10)), width=55, height=16, wrap="word")
+                body_box.insert("1.0", full["body_text"])
+                body_box.config(state="disabled")
+                body_box.pack(fill="both", expand=True, padx=fs(12), pady=(0, fs(8)))
+
+            if full["has_image"] and full["full_path"]:
+                def open_image():
+                    try:
+                        os.startfile(full["full_path"])
+                    except Exception as e:
+                        messagebox.showerror("เปิดไม่สำเร็จ", str(e), parent=view_win)
+
+                tk.Button(
+                    view_win, text="📷 เปิดรูปภาพ", font=("Tahoma", fs(9), "bold"), bg="#1a5a9a", fg="white",
+                    command=open_image,
+                ).pack(anchor="w", padx=fs(12), pady=(0, fs(10)))
+
+            tk.Button(view_win, text="ปิด", font=("Tahoma", fs(10)), command=view_win.destroy).pack(
+                pady=(0, fs(12))
+            )
+
+            view_win.lift()
+            view_win.focus_force()
 
         def delete_doc(d):
             if not messagebox.askyesno("ยืนยัน", "ลบเอกสารนี้ถาวรใช่ไหม?", parent=win):
@@ -3521,7 +3599,10 @@ class LabelApp:
         win.title("AI ช่วยค้นข้อมูล")
         win.geometry(f"{fs(520)}x{fs(600)}")
         win.transient(self.root)
-        win.grab_set()
+        # No grab_set() - deliberately non-modal, so this can stay open at
+        # the same time as "ประวัติผู้ป่วย" and the two can be switched
+        # between freely (e.g. to copy AI conversation text and paste it
+        # into a patient document without closing this window first).
 
         tk.Label(
             win, text="⚠ คำตอบจาก AI เป็นข้อมูลอ้างอิงประกอบการตัดสินใจเท่านั้น ไม่ใช่คำวินิจฉัยทางการแพทย์ "
@@ -3587,7 +3668,19 @@ class LabelApp:
         )
         clear_btn.pack(side="left")
 
-        tk.Label(win, text="บทสนทนา", font=("Tahoma", fs(10), "bold")).pack(anchor="w", padx=fs(10), pady=(fs(4), 0))
+        transcript_header_row = tk.Frame(win)
+        transcript_header_row.pack(fill="x", padx=fs(10), pady=(fs(4), 0))
+        tk.Label(transcript_header_row, text="บทสนทนา", font=("Tahoma", fs(10), "bold")).pack(side="left")
+
+        def copy_transcript():
+            text = response_text.get("1.0", "end-1c")
+            win.clipboard_clear()
+            win.clipboard_append(text)
+
+        tk.Button(
+            transcript_header_row, text="📋 คัดลอก", font=("Tahoma", fs(8)), command=copy_transcript,
+        ).pack(side="right")
+
         response_text = tk.Text(win, font=("Tahoma", fs(10)), bd=1, relief="solid", wrap="word", state="disabled")
         response_text.pack(fill="both", expand=True, padx=fs(10), pady=(fs(2), fs(8)))
 
@@ -3670,7 +3763,7 @@ class LabelApp:
 
         win = tk.Toplevel(self.root)
         win.title("ชื่อผู้ป่วย")
-        win.geometry(f"{fs(360)}x{fs(300)}")
+        win.geometry(f"{fs(360)}x{fs(450)}")
         win.transient(self.root)
         win.grab_set()
 
@@ -3685,6 +3778,46 @@ class LabelApp:
         entry = tk.Entry(win, textvariable=patient_var, font=("Tahoma", fs(12)))
         entry.pack(fill="x", padx=fs(14), pady=fs(4))
         entry.select_range(0, "end")
+
+        # Live autocomplete against both ประวัติผู้ป่วย and ประวัติการจ่ายยา
+        # (prefix/contains match - see storage.search_patient_name_suggestions)
+        # so a returning patient can be picked after typing just a few
+        # letters, without opening "บันทึกลงแฟ้มผู้ป่วย" first.
+        name_suggest = tk.Listbox(win, font=("Tahoma", fs(9)), height=10, exportselection=False)
+        name_suggest_results = []
+
+        def on_name_typed(*_a):
+            term = patient_var.get().strip()
+            name_suggest.delete(0, tk.END)
+            name_suggest_results.clear()
+            if not term or anon_var.get():
+                name_suggest.pack_forget()
+                return
+            try:
+                name_suggest_results.extend(storage.search_patient_name_suggestions(term))
+            except Exception:
+                name_suggest.pack_forget()
+                return
+            if not name_suggest_results:
+                name_suggest.pack_forget()
+                return
+            for p in name_suggest_results:
+                phone_part = f" - {p['phone']}" if p["phone"] else ""
+                name_suggest.insert(tk.END, f"{p['name']}{phone_part}")
+            name_suggest.pack(fill="x", padx=fs(14), pady=(0, fs(4)))
+
+        def on_name_pick(event=None):
+            sel = name_suggest.curselection()
+            if not sel:
+                return
+            p = name_suggest_results[sel[0]]
+            patient_var.set(p["name"])
+            phone_var.set(p["phone"])
+            name_suggest.delete(0, tk.END)
+            name_suggest.pack_forget()
+
+        patient_var.trace_add("write", on_name_typed)
+        name_suggest.bind("<<ListboxSelect>>", on_name_pick)
 
         anon_var = tk.BooleanVar(value=False)
 
