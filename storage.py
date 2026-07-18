@@ -285,14 +285,18 @@ def upsert_template(idproduct, drug):
 
 
 def bulk_import_names_and_barcodes(rows):
-    """rows: list of (name, barcode) tuples from an Excel import that has
-    both columns (barcode may be blank per-row, or the whole column may be
-    absent - see read_excel_drug_names_and_barcodes()). Handles two cases
-    with one code path, since they're really the same operation: (1) a
-    fresh import where most names are brand new - creates a blank template
-    set too; (2) adding barcodes to drugs that already exist and already
-    have dosing filled in - touches ONLY the barcode column on a name match,
-    never overwrites drug2/qty/per_day/etc. Returns
+    """rows: list of (name, barcode, generic_name) tuples from an Excel
+    import (barcode/generic_name may be blank per-row, or the whole column
+    may be absent - see read_excel_drug_names_and_barcodes()). Handles two
+    cases with one code path, since they're really the same operation: (1) a
+    fresh import where most names are brand new - creates a template with
+    drug2 (generic name) prefilled if given; (2) adding barcodes/generic
+    names to drugs that already exist and already have dosing filled in -
+    touches ONLY the barcode/drug2 columns on a name match, never overwrites
+    qty/per_day/note/etc. A literal "NT" generic-name value (a real
+    not-applicable placeholder seen in at least one shop's POS export, e.g.
+    for non-drug items like bandages) is treated as blank rather than
+    imported as visible label text. Returns
     (created, updated_barcode, skipped_blank)."""
     conn = _connect()
     created = updated_barcode = skipped_blank = 0
@@ -300,9 +304,13 @@ def bulk_import_names_and_barcodes(rows):
         cur = conn.cursor()
         now = datetime.now().isoformat()
         seen_this_batch = set()
-        for raw_name, raw_barcode in rows:
+        for row in rows:
+            raw_name, raw_barcode, raw_generic = (list(row) + ["", "", ""])[:3]
             name = (raw_name or "").strip()
             barcode = (raw_barcode or "").strip()
+            generic = (raw_generic or "").strip()
+            if generic.upper() == "NT":
+                generic = ""
             if not name or name in seen_this_batch:
                 skipped_blank += 1
                 continue
@@ -310,17 +318,25 @@ def bulk_import_names_and_barcodes(rows):
             cur.execute("SELECT id FROM drug_templates WHERE drug1 = ?", (name,))
             existing = cur.fetchone()
             if existing:
-                if barcode:
-                    cur.execute("UPDATE drug_templates SET barcode = ? WHERE id = ?", (barcode, existing[0]))
+                if barcode or generic:
+                    sets, params = [], []
+                    if barcode:
+                        sets.append("barcode = ?")
+                        params.append(barcode)
+                    if generic:
+                        sets.append("drug2 = ?")
+                        params.append(generic)
+                    params.append(existing[0])
+                    cur.execute(f"UPDATE drug_templates SET {', '.join(sets)} WHERE id = ?", params)
                     updated_barcode += 1
             else:
                 cur.execute(
                     """
                     INSERT INTO drug_templates
                         (drug1, drug2, note, qty, unit, per_day, every_hr, meal, times, extra_labels, barcode, updated_at)
-                    VALUES (?, '', '', '', '', '', '', '', '[]', '[]', ?, ?)
+                    VALUES (?, ?, '', '', '', '', '', '', '[]', '[]', ?, ?)
                     """,
-                    (name, barcode, now),
+                    (name, generic, barcode, now),
                 )
                 created += 1
         conn.commit()
@@ -343,6 +359,19 @@ def count_templates():
     conn = _connect()
     try:
         return conn.execute("SELECT COUNT(*) FROM drug_templates").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def list_all_template_names():
+    """Every saved drug's trade name (ชื่อการค้า), alphabetical - for the
+    "แสดงยาทั้งหมด" button in ⚙️ ตั้งค่า, so a pharmacist can sanity-check
+    what's actually in this machine's local DB (e.g. before/after an Excel
+    import or a ล้าง DB) without needing to search one name at a time."""
+    conn = _connect()
+    try:
+        rows = conn.execute("SELECT drug1 FROM drug_templates ORDER BY drug1 COLLATE NOCASE").fetchall()
+        return [r[0] for r in rows]
     finally:
         conn.close()
 

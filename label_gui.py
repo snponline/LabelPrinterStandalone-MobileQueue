@@ -153,8 +153,9 @@ def save_product_med_info(idproduct, drug):
     return storage.upsert_template(idproduct, drug)
 
 
-DEFAULT_EXCEL_NAME_COLUMNS = ["ชื่อการค้า", "ชื่อสินค้า", "ชื่อยา"]
-DEFAULT_EXCEL_BARCODE_COLUMNS = ["บาร์โค้ด", "Barcode", "barcode"]
+DEFAULT_EXCEL_NAME_COLUMNS = ["ชื่อการค้า", "ชื่อสินค้า", "ชื่อยา", "ชื่อการค้า/ชื่อสินค้า", "col1"]
+DEFAULT_EXCEL_BARCODE_COLUMNS = ["บาร์โค้ด", "Barcode", "barcode", "บาร์โค้ดในหน่วยนับ 1", "col2"]
+DEFAULT_EXCEL_GENERIC_COLUMNS = ["ชื่อสามัญทางยา", "ชื่อสามัญ", "Generic Name", "generic name", "col3"]
 
 
 def export_backup(zip_path):
@@ -197,20 +198,26 @@ def import_backup(zip_path):
 _MAX_HEADER_SCAN_ROWS = 10
 
 
-def read_excel_drug_names_and_barcodes(path, name_column=None, barcode_column=None):
-    """Read drug trade names (and an optional barcode column on the same
-    header row) out of the first sheet of an .xlsx file - covers both a
-    fresh import (names + barcodes together) and adding barcodes to drugs
-    that already exist (see storage.bulk_import_names_and_barcodes(), which
-    treats a name match as "update barcode only, don't touch dosing").
-    Scans the first several rows (not just row 1) for a header match - some
-    exported files have a title row or blank row above the real header -
-    matching case-insensitively and ignoring extra spaces. If name_column is
-    blank, tries DEFAULT_EXCEL_NAME_COLUMNS in order; same for
-    barcode_column/DEFAULT_EXCEL_BARCODE_COLUMNS, except the barcode column
-    is best-effort - if it can't be found, every row's barcode is just
-    empty. Raises ValueError with a Thai message (including what headers
-    were actually seen) only if the NAME column can't be found."""
+def read_excel_drug_names_and_barcodes(path, name_column=None, barcode_column=None, generic_column=None):
+    """Read drug trade names (plus optional barcode/generic-name columns)
+    out of the first sheet of an .xlsx file - covers a fresh import (names
+    + barcodes + generic names together) and adding barcodes/generic names
+    to drugs that already exist (see storage.bulk_import_names_and_barcodes(),
+    which treats a name match as "update barcode/generic name only, don't
+    touch dosing"). Scans the first several rows (not just row 1) for header
+    matches - some exported files have a title row or blank row above the
+    real header, or even a genuinely two-row header where sub-columns (e.g.
+    a barcode column) sit one row below the main header (a real POS export
+    shape - the name/generic columns are on the "category" row, the barcode
+    column is on the "sub-column" row directly under it). Each of
+    name/barcode/generic is searched independently across every scanned
+    header row - they don't need to share one row. Matching is
+    case-insensitive and ignores extra whitespace. If a *_column arg is
+    blank, tries the matching DEFAULT_EXCEL_*_COLUMNS list in order;
+    barcode/generic are best-effort - if not found, every row's value for
+    that field is just empty. Raises ValueError with a Thai message
+    (including what headers were actually seen) only if the NAME column
+    can't be found."""
     from openpyxl import load_workbook
     wb = load_workbook(path, read_only=True, data_only=True)
     ws = wb.active
@@ -220,10 +227,11 @@ def read_excel_drug_names_and_barcodes(path, name_column=None, barcode_column=No
     name_candidates_lower = [c.lower() for c in ([name_column] if name_column else DEFAULT_EXCEL_NAME_COLUMNS)]
     barcode_column = (barcode_column or "").strip()
     barcode_candidates_lower = [c.lower() for c in ([barcode_column] if barcode_column else DEFAULT_EXCEL_BARCODE_COLUMNS)]
+    generic_column = (generic_column or "").strip()
+    generic_candidates_lower = [c.lower() for c in ([generic_column] if generic_column else DEFAULT_EXCEL_GENERIC_COLUMNS)]
 
-    name_idx = None
-    barcode_idx = None
-    header_row_num = None
+    name_idx = barcode_idx = generic_idx = None
+    last_header_row_num = 0
     scanned_headers = []
     for row_num, row in enumerate(rows, start=1):
         if row_num > _MAX_HEADER_SCAN_ROWS:
@@ -231,19 +239,24 @@ def read_excel_drug_names_and_barcodes(path, name_column=None, barcode_column=No
         header = [str(h).strip() if h is not None else "" for h in row]
         header_lower = [h.lower() for h in header]
         scanned_headers.append((row_num, header))
-        for cand_lower in name_candidates_lower:
-            if cand_lower in header_lower:
-                name_idx = header_lower.index(cand_lower)
-                header_row_num = row_num
-                break
-        if name_idx is not None:
-            # barcode column (if present) is expected on this same header
-            # row - a real Excel file only has one header row
+        if name_idx is None:
+            for cand_lower in name_candidates_lower:
+                if cand_lower in header_lower:
+                    name_idx = header_lower.index(cand_lower)
+                    last_header_row_num = row_num
+                    break
+        if barcode_idx is None:
             for cand_lower in barcode_candidates_lower:
                 if cand_lower in header_lower:
                     barcode_idx = header_lower.index(cand_lower)
+                    last_header_row_num = max(last_header_row_num, row_num)
                     break
-            break
+        if generic_idx is None:
+            for cand_lower in generic_candidates_lower:
+                if cand_lower in header_lower:
+                    generic_idx = header_lower.index(cand_lower)
+                    last_header_row_num = max(last_header_row_num, row_num)
+                    break
 
     if name_idx is None:
         hint = (
@@ -264,14 +277,17 @@ def read_excel_drug_names_and_barcodes(path, name_column=None, barcode_column=No
     wb2 = load_workbook(path, read_only=True, data_only=True)
     ws2 = wb2.active
     for row_num, row in enumerate(ws2.iter_rows(values_only=True), start=1):
-        if row_num <= header_row_num:
+        if row_num <= last_header_row_num:
             continue
         if name_idx < len(row) and row[name_idx] is not None:
             name = str(row[name_idx])
             barcode = ""
             if barcode_idx is not None and barcode_idx < len(row) and row[barcode_idx] is not None:
                 barcode = str(row[barcode_idx])
-            rows_out.append((name, barcode))
+            generic = ""
+            if generic_idx is not None and generic_idx < len(row) and row[generic_idx] is not None:
+                generic = str(row[generic_idx])
+            rows_out.append((name, barcode, generic))
     return rows_out
 
 
@@ -911,10 +927,47 @@ def build_settings_dialog(parent, first_run=False):
             removed = storage.clear_all_templates()
             messagebox.showinfo("สำเร็จ", f"ลบข้อมูลยาแล้ว {removed} รายการ", parent=dialog_win)
 
+        def on_show_all_drugs():
+            names = storage.list_all_template_names()
+            list_win = tk.Toplevel(dialog_win)
+            list_win.title(f"ยาทั้งหมดในเครื่องนี้ ({len(names)} รายการ)")
+            list_win.geometry(f"{fs(380)}x{fs(480)}")
+            list_win.transient(dialog_win)
+            list_win.grab_set()
+
+            tk.Label(
+                list_win, text=f"ยาทั้งหมดในเครื่องนี้ ({len(names)} รายการ)",
+                font=("Tahoma", fs(11), "bold"),
+            ).pack(anchor="w", padx=fs(10), pady=(fs(10), fs(4)))
+
+            list_frame = tk.Frame(list_win)
+            list_frame.pack(fill="both", expand=True, padx=fs(10), pady=(0, fs(8)))
+            scrollbar = tk.Scrollbar(list_frame, orient="vertical")
+            listbox = tk.Listbox(list_frame, font=("Tahoma", fs(10)), yscrollcommand=scrollbar.set)
+            scrollbar.config(command=listbox.yview)
+            scrollbar.pack(side="right", fill="y")
+            listbox.pack(side="left", fill="both", expand=True)
+            if names:
+                for n in names:
+                    listbox.insert(tk.END, n)
+            else:
+                listbox.insert(tk.END, "(ยังไม่มีข้อมูลยาในเครื่องนี้เลย)")
+
+            tk.Button(list_win, text="ปิด", font=("Tahoma", fs(10)), command=list_win.destroy).pack(
+                pady=(0, fs(10)))
+            list_win.lift()
+            list_win.focus_force()
+
+        clear_row = tk.Frame(footer)
+        clear_row.pack(pady=(0, fs(10)))
         tk.Button(
-            footer, text="🗑 ล้าง DB (ลบข้อมูลยาทั้งหมด)", font=("Tahoma", fs(9)),
+            clear_row, text="📋 แสดงยาทั้งหมด", font=("Tahoma", fs(9)),
+            command=on_show_all_drugs,
+        ).pack(side="left", padx=(0, fs(6)))
+        tk.Button(
+            clear_row, text="🗑 ล้าง DB (ลบข้อมูลยาทั้งหมด)", font=("Tahoma", fs(9)),
             fg="#a02020", command=on_clear_db,
-        ).pack(pady=(0, fs(10)))
+        ).pack(side="left")
 
         def on_export():
             path = filedialog.asksaveasfilename(
@@ -1385,23 +1438,41 @@ class LabelApp:
         self.open_edit_dialog(index, is_new=True)
 
     def open_import_excel_dialog(self):
-        """Bulk-create blank drug templates (ชื่อการค้า only) from an Excel
-        file - for a pharmacy migrating a list of drug names in from
-        elsewhere. Never overwrites a drug that's already saved."""
+        """Bulk-create blank drug templates (ชื่อการค้า + optional
+        บาร์โค้ด/ชื่อสามัญ) from an Excel file - for a pharmacy migrating a
+        list of drug names in from elsewhere. Never overwrites dosing info
+        on a drug that's already saved.
+
+        No column-name entry fields here on purpose - real-world exported
+        files have wildly inconsistent/multi-row headers (see
+        read_excel_drug_names_and_barcodes()'s docstring), so instead of
+        asking the pharmacist to type an exact header string that's easy to
+        typo, the file itself gets pre-edited (by whoever prepares it) to
+        use the fixed col1/col2/col3 header names - always found instantly,
+        no typing needed here at all. The auto-detect list still also tries
+        several common Thai/English header names as a bonus, in case
+        someone imports a file without col1/col2/col3."""
         win = tk.Toplevel(self.root)
         win.title("Import รายชื่อยาจาก Excel")
-        win.geometry(f"{fs(440)}x{fs(480)}")
+        win.geometry(f"{fs(440)}x{fs(320)}")
         win.transient(self.root)
         win.grab_set()
 
         pad = {"padx": fs(10), "pady": fs(4)}
 
         tk.Label(
-            win, text="เลือกไฟล์ Excel (.xlsx) ที่มีรายชื่อยา (และบาร์โค้ดถ้ามี) - ยาที่ยังไม่มีในเครื่องจะถูก"
-                       "สร้างรายการเปล่าให้ (ยังไม่มีวิธีใช้ กรอกเพิ่มทีหลังได้) ส่วนยาที่มีอยู่แล้วจะ"
-                       "**ไม่ถูกเขียนทับ** - ยกเว้นคอลัมน์บาร์โค้ดที่จะอัปเดตให้ถ้าไฟล์มีค่าใหม่มา "
-                       "(ใช้ไฟล์นี้เพิ่มบาร์โค้ดให้ยาที่กรอกวิธีใช้ไว้แล้วได้เลย โดยไม่กระทบข้อมูลเดิม)",
+            win, text="ก่อน import ให้เปิดไฟล์ Excel แล้วเปลี่ยนชื่อหัวตาราง (แถวแรก) ของ 3 คอลัมน์นี้ก่อน แล้ว Save ไฟล์:\n"
+                       "• คอลัมน์ชื่อยา → เปลี่ยนเป็น col1\n"
+                       "• คอลัมน์บาร์โค้ด (ไม่บังคับ) → เปลี่ยนเป็น col2\n"
+                       "• คอลัมน์ชื่อสามัญทางยา (ไม่บังคับ) → เปลี่ยนเป็น col3\n"
+                       "(พิมพ์ตัวเล็กตัวใหญ่ไม่มีผล) เสร็จแล้วค่อยเลือกไฟล์มา import ด้านล่าง ระบบจะหาคอลัมน์ให้เองอัตโนมัติ",
             font=("Tahoma", fs(9), "bold"), wraplength=fs(400), justify="left",
+        ).pack(anchor="w", **pad)
+
+        tk.Label(
+            win, text="ยาที่ยังไม่มีในเครื่องจะถูกสร้างรายการเปล่าให้ (ยังไม่มีวิธีใช้ กรอกเพิ่มทีหลังได้) "
+                       "ส่วนยาที่มีอยู่แล้วจะ**ไม่ถูกเขียนทับ** - ยกเว้นบาร์โค้ด/ชื่อสามัญที่จะอัปเดตให้ถ้าไฟล์มีค่าใหม่มา",
+            font=("Tahoma", fs(8)), fg="#555", wraplength=fs(400), justify="left",
         ).pack(anchor="w", **pad)
 
         file_var = tk.StringVar(value="")
@@ -1420,21 +1491,6 @@ class LabelApp:
         tk.Button(file_row, text="เลือกไฟล์...", font=("Tahoma", fs(9)), command=choose_file).pack(
             side="left", padx=(fs(4), 0))
 
-        tk.Label(
-            win, text=f"ชื่อ column ที่เก็บชื่อยา (เว้นว่างได้ - จะลองหา {', '.join(DEFAULT_EXCEL_NAME_COLUMNS)} ให้อัตโนมัติ)",
-            font=("Tahoma", fs(9), "bold"), wraplength=fs(400), justify="left",
-        ).pack(anchor="w", **pad)
-        column_var = tk.StringVar(value="")
-        tk.Entry(win, textvariable=column_var, font=("Tahoma", fs(10))).pack(fill="x", **pad)
-
-        tk.Label(
-            win, text=f"ชื่อ column ที่เก็บบาร์โค้ด (ไม่บังคับ - เว้นว่างได้ จะลองหา "
-                       f"{', '.join(DEFAULT_EXCEL_BARCODE_COLUMNS)} ให้อัตโนมัติ ถ้าไม่มีในไฟล์ก็ไม่เป็นไร)",
-            font=("Tahoma", fs(9), "bold"), wraplength=fs(400), justify="left",
-        ).pack(anchor="w", **pad)
-        barcode_column_var = tk.StringVar(value="")
-        tk.Entry(win, textvariable=barcode_column_var, font=("Tahoma", fs(10))).pack(fill="x", **pad)
-
         status_var = tk.StringVar(value="")
         tk.Label(win, textvariable=status_var, font=("Tahoma", fs(14), "bold"), fg="#a00",
                  wraplength=fs(400), justify="left").pack(**pad)
@@ -1449,7 +1505,7 @@ class LabelApp:
 
             def worker():
                 try:
-                    rows = read_excel_drug_names_and_barcodes(path, column_var.get(), barcode_column_var.get())
+                    rows = read_excel_drug_names_and_barcodes(path)
                 except Exception as e:
                     self.root.after(0, lambda: status_var.set(f"อ่านไฟล์ไม่สำเร็จ: {e}"))
                     self.root.after(0, lambda: import_btn.config(state="normal"))
