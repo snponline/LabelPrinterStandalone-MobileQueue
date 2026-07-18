@@ -51,6 +51,14 @@ def _connect():
         conn.execute("ALTER TABLE drug_templates ADD COLUMN exp_date TEXT")
     if "label_qty" not in existing_cols:
         conn.execute("ALTER TABLE drug_templates ADD COLUMN label_qty TEXT")
+    # Cached Grok (xAI) translations of "note" (Indication), generated on
+    # demand when previewing/printing an English/Burmese label - see
+    # translate_note_via_grok() in label_gui.py. Cleared whenever the Thai
+    # source text is edited, so a stale translation can never survive an edit.
+    if "note_en" not in existing_cols:
+        conn.execute("ALTER TABLE drug_templates ADD COLUMN note_en TEXT")
+    if "note_mm" not in existing_cols:
+        conn.execute("ALTER TABLE drug_templates ADD COLUMN note_mm TEXT")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS print_queue (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -209,7 +217,7 @@ def get_template(idproduct):
         cur = conn.cursor()
         cur.execute(
             "SELECT drug1, drug2, note, qty, unit, per_day, every_hr, meal, times, extra_labels, usage_mode, barcode, "
-            "exp_date, label_qty "
+            "exp_date, label_qty, note_en, note_mm "
             "FROM drug_templates WHERE id = ?",
             (idproduct,),
         )
@@ -217,7 +225,7 @@ def get_template(idproduct):
         if not row:
             return None
         (drug1, drug2, note, qty, unit, per_day, every_hr, meal, times_json, extra_json, usage_mode, barcode,
-         exp_date, label_qty) = row
+         exp_date, label_qty, note_en, note_mm) = row
         return {
             "drug1": drug1, "drug2": drug2 or "", "note": note or "",
             "qty": qty or "", "unit": unit or "", "per_day": per_day or "",
@@ -228,7 +236,27 @@ def get_template(idproduct):
             "barcode": barcode or "",
             "exp_date": exp_date or "",
             "label_qty": label_qty or "",
+            "note_en": note_en or "",
+            "note_mm": note_mm or "",
         }
+    finally:
+        conn.close()
+
+
+def save_note_translation(idproduct, lang, text):
+    """Cache a Grok-translated Indication/note into drug_templates.note_en
+    or note_mm, so it's reused next time this drug is picked instead of
+    re-calling the API. Only UPDATEs an existing row (idproduct is the
+    local row id here) - a brand-new, never-saved drug has no row to
+    attach the translation to yet, and the translation is simply not
+    cached in that case (re-translated next time)."""
+    if lang not in ("en", "mm") or not idproduct:
+        return
+    conn = _connect()
+    try:
+        col = "note_en" if lang == "en" else "note_mm"
+        conn.execute(f"UPDATE drug_templates SET {col} = ? WHERE id = ?", (text, idproduct))
+        conn.commit()
     finally:
         conn.close()
 

@@ -879,6 +879,32 @@ def build_a4_pages(label_images):
     return pages
 
 
+LANG_NAMES_FOR_GROK_PROMPT = {"en": "English", "mm": "Burmese (Myanmar script)"}
+
+
+def translate_note_via_grok(note_text, target_lang):
+    """Translate a free-typed Indication/note field via Grok (xAI), reusing
+    the same provider client and stored API key as the existing "AI ช่วยค้น
+    ข้อมูล" feature (ai_assist.call_xai + app_settings' xai_api_key - see
+    ai_assist.py / open_ai_assist_dialog). Returns (translated_text_or_None,
+    error_message_or_None) - never raises, since a failed/unconfigured
+    translation must fall back to the original Thai text rather than block
+    preview/printing."""
+    settings = app_settings.load_settings()
+    api_key = (settings.get("xai_api_key") or "").strip()
+    if not api_key:
+        return None, "ยังไม่ได้ตั้งค่า Grok (xAI) API key - ตั้งค่าได้ที่ปุ่ม 🤖 AI ช่วยค้นข้อมูล ก่อน"
+    lang_name = LANG_NAMES_FOR_GROK_PROMPT.get(target_lang, target_lang)
+    prompt = (
+        f"Translate the following pharmacy label indication/instruction text from Thai to {lang_name}. "
+        f"Reply with ONLY the translated text - no explanation, no quotes, no extra commentary:\n\n{note_text}"
+    )
+    ok, text = ai_assist.call_xai(api_key, prompt)
+    if not ok:
+        return None, text
+    return text.strip(), None
+
+
 def print_image(img, printer_name=None):
     import win32print
     import win32ui
@@ -1535,6 +1561,11 @@ class LabelApp:
                 "exp_date": info.get("exp_date", ""),
                 "label_qty": info.get("label_qty", ""),
                 "lang": "th",
+                # Cached Grok translations of "note" - only valid as long as
+                # "note" itself doesn't change (see collect_into_d, which
+                # clears these if the pharmacist edits the Indication text).
+                "note_en": info.get("note_en", ""),
+                "note_mm": info.get("note_mm", ""),
             }
         else:
             entry = {
@@ -1550,6 +1581,8 @@ class LabelApp:
                 "exp_date": (info.get("exp_date", "") if info else ""),
                 "label_qty": (info.get("label_qty", "") if info else ""),
                 "lang": "th",
+                "note_en": (info.get("note_en", "") if info else ""),
+                "note_mm": (info.get("note_mm", "") if info else ""),
             }
         self.selected_drugs.append(entry)
         self.refresh_selected_list()
@@ -1566,6 +1599,7 @@ class LabelApp:
             "unit": "เม็ด", "per_day": "", "every_hr": "", "meal": "หลังอาหาร",
             "times": [], "extra_labels": [], "usage_mode": "oral", "barcode": "",
             "status": "missing", "print_qty": 1, "exp_date": "", "label_qty": "", "lang": "th",
+            "note_en": "", "note_mm": "",
         }
         self.selected_drugs.append(entry)
         index = len(self.selected_drugs) - 1
@@ -1822,7 +1856,47 @@ class LabelApp:
 
     def preview_label(self, index):
         d = self.selected_drugs[index]
+        lang = d.get("lang", "th")
+        note = (d.get("note") or "").strip()
+        cache_key = f"note_{lang}"
+        # Indication (note) is free-typed and never auto-translated except
+        # here, on demand: if this drug has Thai note text and the label
+        # language isn't Thai, and we don't already have a cached Grok
+        # translation for it, fetch one now (threaded - Grok can take a
+        # few seconds and must never freeze the window) before opening the
+        # preview, so the preview always shows what will actually print.
+        if lang in ("en", "mm") and note and not d.get(cache_key):
+            self.status_var.set("กำลังแปล Indication ด้วย Grok...")
+
+            def worker():
+                translated, _err = translate_note_via_grok(note, lang)
+                def done():
+                    self.status_var.set("")
+                    if translated:
+                        d[cache_key] = translated
+                        idproduct = d.get("idproduct")
+                        if idproduct:
+                            storage.save_note_translation(idproduct, lang, translated)
+                    # On failure (no key configured, network error, etc.) -
+                    # fall back silently to the original Thai text. This is
+                    # a rarely-used convenience feature, not worth a popup
+                    # every time; the preview itself already makes it
+                    # obvious the note stayed Thai.
+                    self._show_label_preview(index)
+                self.root.after(0, done)
+
+            threading.Thread(target=worker, daemon=True).start()
+            return
+        self._show_label_preview(index)
+
+    def _show_label_preview(self, index):
+        d = self.selected_drugs[index]
+        lang = d.get("lang", "th")
         data = dict(d)
+        if lang in ("en", "mm"):
+            translated = d.get(f"note_{lang}")
+            if translated:
+                data["note"] = translated
         data["patient_name"] = "(ชื่อผู้ป่วย)"
         data["has_allergy"] = self.allergy_var.get()
         if data["has_allergy"]:
@@ -2525,7 +2599,15 @@ class LabelApp:
             d["drug1"] = drug1_var.get().strip()
             d["barcode"] = barcode_var.get().strip()
             d["drug2"] = drug2_var.get().strip()
-            d["note"] = note_var.get().strip()
+            new_note = note_var.get().strip()
+            if new_note != d.get("note", ""):
+                # Indication text changed - any Grok translation cached
+                # against the old text is now stale, force a re-translate
+                # next time this drug is previewed/printed on a
+                # non-Thai label.
+                d["note_en"] = ""
+                d["note_mm"] = ""
+            d["note"] = new_note
             d["qty"] = qty_var.get().strip()
             d["unit"] = unit_var.get().strip()
             d["per_day"] = per_day_var.get().strip()
@@ -3797,6 +3879,27 @@ class LabelApp:
                         data["patient_name"] = name
                         data["has_allergy"] = has_allergy
                         data["allergy_drug_name"] = allergy_drug_name
+                        lang = d.get("lang", "th")
+                        note = (d.get("note") or "").strip()
+                        if lang in ("en", "mm") and note:
+                            # Already threaded (this whole worker runs off
+                            # the UI thread) - safe to call Grok
+                            # synchronously here. Reuses the cache from
+                            # preview_label() if the pharmacist already
+                            # previewed; translates on the spot otherwise,
+                            # so printing without ever clicking Preview
+                            # still produces a translated Indication line
+                            # instead of silently printing Thai text.
+                            translated = d.get(f"note_{lang}")
+                            if not translated:
+                                translated, _err = translate_note_via_grok(note, lang)
+                                if translated:
+                                    d[f"note_{lang}"] = translated
+                                    idproduct = d.get("idproduct")
+                                    if idproduct:
+                                        storage.save_note_translation(idproduct, lang, translated)
+                            if translated:
+                                data["note"] = translated
                         img = build_label_image(data, settings)
                         label_imgs.extend([img] * d.get("print_qty", 1))
                     if label_imgs:
