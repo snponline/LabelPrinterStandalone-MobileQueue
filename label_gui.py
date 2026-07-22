@@ -66,8 +66,8 @@ UNIT_OPTIONS = ["เม็ด", "แคปซูล", "ช้อนชา", "ช
 # translated here - drug names/notes/extra_labels are whatever the
 # pharmacist actually typed and are never auto-translated (medical-accuracy
 # risk), so English/Burmese output still needs those typed in that language.
-LABEL_LANGS = ["th", "en", "mm"]
-LABEL_LANG_NAMES = {"th": "ไทย", "en": "English", "mm": "မြန်မာ"}
+LABEL_LANGS = ["th", "en", "mm", "zh"]
+LABEL_LANG_NAMES = {"th": "ไทย", "en": "English", "mm": "พม่า", "zh": "จีน"}
 TIME_EN = {"เช้า": "Morning", "เที่ยง": "Noon", "เย็น": "Evening", "ก่อนนอน": "Before bed"}
 MEAL_EN = {"ก่อนอาหาร": "Before meals", "หลังอาหาร": "After meals"}
 UNIT_EN = {
@@ -82,9 +82,18 @@ UNIT_MM = {
     "เม็ด": "ဆေးပြား", "แคปซูล": "ဆေးတောင့်", "ช้อนชา": "လက်ဖက်ရည်ဇွန်း", "ช้อนโต๊ะ": "စားပွဲတင်ဇွန်း",
     "ซอง": "ထုပ်", "ml": "ml", "หยด": "စက်", "พ่น": "ဖျန်း",
 }
-TIME_TR = {"en": TIME_EN, "mm": TIME_MM}
-MEAL_TR = {"en": MEAL_EN, "mm": MEAL_MM}
-UNIT_TR = {"en": UNIT_EN, "mm": UNIT_MM}
+# Chinese - drafted by Claude (higher confidence than Burmese, still not a
+# native speaker) - recommended a native/professional review pass before
+# real deployment, same caution as the Burmese set above.
+TIME_ZH = {"เช้า": "早上", "เที่ยง": "中午", "เย็น": "晚上", "ก่อนนอน": "睡前"}
+MEAL_ZH = {"ก่อนอาหาร": "饭前", "หลังอาหาร": "饭后"}
+UNIT_ZH = {
+    "เม็ด": "片", "แคปซูล": "粒", "ช้อนชา": "茶匙", "ช้อนโต๊ะ": "汤匙",
+    "ซอง": "包", "ml": "ml", "หยด": "滴", "พ่น": "喷",
+}
+TIME_TR = {"en": TIME_EN, "mm": TIME_MM, "zh": TIME_ZH}
+MEAL_TR = {"en": MEAL_EN, "mm": MEAL_MM, "zh": MEAL_ZH}
+UNIT_TR = {"en": UNIT_EN, "mm": UNIT_MM, "zh": UNIT_ZH}
 
 
 def _tr_times(times, lang):
@@ -306,11 +315,13 @@ def read_excel_drug_names_and_barcodes(path, name_column=None, barcode_column=No
 
 
 def find_font(size, bold=False, lang="th"):
-    # Tahoma/Leelawadee UI have no Myanmar glyphs at all - a Burmese label
-    # needs the Windows-bundled Myanmar Text font instead, for every string
+    # Tahoma/Leelawadee UI have no Myanmar/Chinese glyphs at all - those
+    # labels need the Windows-bundled fonts below instead, for every string
     # (including digits/EXP), not just the translated phrases.
     if lang == "mm":
         candidates = [r"C:\Windows\Fonts\mmrtextb.ttf"] if bold else [r"C:\Windows\Fonts\mmrtext.ttf"]
+    elif lang == "zh":
+        candidates = [r"C:\Windows\Fonts\msyhbd.ttc"] if bold else [r"C:\Windows\Fonts\msyh.ttc"]
     else:
         candidates = (
             [r"C:\Windows\Fonts\tahomabd.ttf", r"C:\Windows\Fonts\leelawui.ttf"]
@@ -325,15 +336,18 @@ def find_font(size, bold=False, lang="th"):
 
 def detect_font_lang(text):
     """Free-typed fields (patient name, drug1/drug2, note) can hold Thai,
-    English, or Burmese text depending on what the pharmacist actually
-    typed there - pick the font by inspecting the real characters instead
-    of trusting the label-language dropdown, since e.g. a patient's name
-    is Thai even on a Burmese-language label, while a pharmacist who has
-    an expert's Burmese translation for the indication should have that
-    render correctly too."""
+    English, Burmese, or Chinese text depending on what the pharmacist
+    actually typed there - pick the font by inspecting the real characters
+    instead of trusting the label-language dropdown, since e.g. a patient's
+    name is Thai even on a Burmese/Chinese-language label, while a
+    pharmacist who has a translated indication should have that render
+    correctly too."""
     for ch in text or "":
-        if 0x1000 <= ord(ch) <= 0x109F:
+        cp = ord(ch)
+        if 0x1000 <= cp <= 0x109F:
             return "mm"
+        if 0x4E00 <= cp <= 0x9FFF:
+            return "zh"
     return "th"
 
 
@@ -445,6 +459,31 @@ def compute_dose_lines(data):
                 line2 += f"   နာရီ {data['every_hr']} တိုင်း"
         return dose_text, line2
 
+    if lang == "zh":
+        if usage_mode == "topical":
+            dose_text = f"薄涂，每日{data.get('per_day') or '__'}次"
+            line2 = "  ".join(times)
+            if data.get("every_hr"):
+                line2 += f"   每{data['every_hr']}小时"
+        elif usage_mode == "drops":
+            dose_text = f"每次{data.get('qty') or '__'}滴"
+            if data.get("per_day"):
+                dose_text += f"，每日{data['per_day']}次"
+            line2 = "  ".join(times)
+            if data.get("every_hr"):
+                line2 += f"   每{data['every_hr']}小时"
+        else:
+            unit = _tr_unit(data.get("unit"), lang)
+            dose_text = f"每次{data.get('qty') or '__'}{unit}"
+            if data.get("per_day"):
+                dose_text += f"，每日{data['per_day']}次"
+            line2 = _tr_meal(data.get("meal"), lang)
+            if times:
+                line2 += ("    " if line2 else "") + "  ".join(times)
+            if data.get("every_hr"):
+                line2 += f"   每{data['every_hr']}小时"
+        return dose_text, line2
+
     if usage_mode == "topical":
         # ยาทา: no unit/meal - "ทาบางๆ วันละ N ครั้ง" then times/every_hr only
         dose_text = f"ทาบางๆ วันละ {data.get('per_day') or '__'} ครั้ง"
@@ -521,7 +560,21 @@ EXTRA_LABEL_MM = {
     "หยดต่อเนื่อง 2 สัปดาห์": "၂ ပတ်ဆက်တိုက် ခတ်ပေးပါ",
     "ยาหยอดตาใช้ได้ 3 เดือน": "မျက်စဉ်းဆေးကို ဖွင့်ပြီး ၃ လအထိသာ သုံးစွဲနိုင်သည်",
 }
-EXTRA_LABEL_TR = {"en": EXTRA_LABEL_EN, "mm": EXTRA_LABEL_MM}
+EXTRA_LABEL_ZH = {
+    "ทานยาก่อนอาหาร 1/2-1 ชม": "餐前30-60分钟服用",
+    "ทานยาหลังอาหารทันที": "餐后立即服用",
+    "ทานติดต่อกันจนหมด": "请按疗程服完",
+    "ดื่มน้ำตามมากๆ": "请多喝水",
+    "ยานี้อาจทำให้ง่วงซึม": "此药可能引起嗜睡",
+    "ห้ามรับประทานพร้อมนม ยาลดกรด": "请勿与牛奶或抗酸药同服",
+    "ทานเมื่อมีอาการ": "有症状时服用",
+    "หายแล้ว ทาต่ออีก 1 สัปดาห์": "症状消退后请继续使用1周",
+    "ทาต่อเนื่อง 2 สัปดาห์": "请连续使用2周",
+    "หยดเมื่อมีอาการ": "有症状时使用",
+    "หยดต่อเนื่อง 2 สัปดาห์": "请连续使用2周",
+    "ยาหยอดตาใช้ได้ 3 เดือน": "开封后3个月内使用",
+}
+EXTRA_LABEL_TR = {"en": EXTRA_LABEL_EN, "mm": EXTRA_LABEL_MM, "zh": EXTRA_LABEL_ZH}
 
 
 def _tr_extra_labels(extra_labels, lang):
@@ -559,7 +612,22 @@ MM_STRINGS = {
     "allergy_prefix": "ဆေးဓာတ်မတည့်မှု - ",
     "pharm_label": "ဆေးဝါးပညာရှင်",
 }
-LANG_STRINGS = {"en": EN_STRINGS, "mm": MM_STRINGS}
+# Chinese - drafted by Claude, recommended a native/professional review pass
+# before real deployment (same caution as MM_STRINGS above).
+ZH_STRINGS = {
+    "date_label": "日期",
+    "patient_label": "患者姓名",
+    "qty_label": "数量",
+    "drug_label": "药名",
+    "generic_label": "通用名",
+    "warning_text": "如有药物过敏、慢性病、怀孕或哺乳，请告知药师",
+    "align_marker": "怀孕或哺乳",
+    "no_allergy_text": "无药物过敏",
+    "see_file_text": "过敏史详见档案",
+    "allergy_prefix": "过敏：",
+    "pharm_label": "药师",
+}
+LANG_STRINGS = {"en": EN_STRINGS, "mm": MM_STRINGS, "zh": ZH_STRINGS}
 
 
 def build_label_image(data, settings):
@@ -569,10 +637,11 @@ def build_label_image(data, settings):
     def ls(key, thai_default):
         if key in L:
             return L[key]
-        if lang == "mm":
-            # mmrtext.ttf has no Thai glyphs - if a Burmese string is still
-            # missing for this key, fall back to English (Latin renders
-            # fine in mmrtext) rather than Thai (would draw as tofu boxes).
+        if lang in ("mm", "zh"):
+            # mmrtext.ttf/msyh.ttc have no Thai glyphs - if a translated
+            # string is still missing for this key, fall back to English
+            # (Latin renders fine in both) rather than Thai (would draw as
+            # tofu boxes).
             return EN_STRINGS.get(key, thai_default)
         return thai_default
 
@@ -607,7 +676,7 @@ def build_label_image(data, settings):
     draw_thai_text(draw, (x, y), company_name, f_bold, fill=0)
 
     DATE_RESERVED_W = 180
-    if lang in ("en", "mm"):
+    if lang in ("en", "mm", "zh"):
         today_str = datetime.now().strftime("%d/%m/%Y")
         date_label = ls("date_label", "วันที่")
     else:
@@ -694,7 +763,7 @@ def build_label_image(data, settings):
 
     draw.line([(x, y), (label_w_px - x, y)], fill=0, width=1)
     y += 16
-    if lang in ("en", "mm"):
+    if lang in ("en", "mm", "zh"):
         # This line auto-shrinks via fit_font below to always leave room for
         # the allergy-status text flush right on the same line - no fixed
         # length limit needed here.
@@ -1824,7 +1893,7 @@ class LabelApp:
         # translation for it, fetch one now (threaded - Grok can take a
         # few seconds and must never freeze the window) before opening the
         # preview, so the preview always shows what will actually print.
-        if lang in ("en", "mm") and note and not d.get(cache_key):
+        if lang in ("en", "mm", "zh") and note and not d.get(cache_key):
             self.status_var.set("กำลังแปล Indication ด้วย Grok...")
 
             def worker():
@@ -1852,7 +1921,7 @@ class LabelApp:
         d = self.selected_drugs[index]
         lang = d.get("lang", "th")
         data = dict(d)
-        if lang in ("en", "mm"):
+        if lang in ("en", "mm", "zh"):
             translated = d.get(f"note_{lang}")
             if translated:
                 data["note"] = translated
@@ -4014,7 +4083,7 @@ class LabelApp:
                         data["allergy_drug_name"] = allergy_drug_name
                         lang = d.get("lang", "th")
                         note = (d.get("note") or "").strip()
-                        if lang in ("en", "mm") and note:
+                        if lang in ("en", "mm", "zh") and note:
                             # Already threaded (this whole worker runs off
                             # the UI thread) - safe to call Grok
                             # synchronously here. Reuses the cache from
