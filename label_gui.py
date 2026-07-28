@@ -31,6 +31,7 @@ import app_settings
 import local_server
 import ai_assist
 import knowledge
+from warranty_ui import WarrantyMixin
 
 FAVORITES_PATH = os.path.join(storage.APP_DATA_DIR, "favorites.json")
 DEBUG_PREVIEW_PATH = os.path.join(storage.APP_DATA_DIR, "_last_label_preview.png")
@@ -52,7 +53,7 @@ def save_favorites(favorites):
         json.dump(favorites, f, ensure_ascii=False, indent=2)
 
 
-APP_VERSION = "1.17.0"
+APP_VERSION = "1.19.4"
 
 DOTS_PER_MM = 8  # matches standard 203dpi thermal label printers
 
@@ -1213,7 +1214,7 @@ def build_settings_dialog(parent, first_run=False):
     return dialog_win
 
 
-class LabelApp:
+class LabelApp(WarrantyMixin):
     def __init__(self, root):
         self.root = root
         root.title(f"พิมพ์ฉลากยา v{APP_VERSION}")
@@ -1246,54 +1247,68 @@ class LabelApp:
         main_frame = tk.Frame(root)
         main_frame.pack(fill="both", expand=True)
 
-        left_frame = tk.Frame(main_frame)
-        left_frame.pack(side="left", fill="both", expand=True)
-
+        # Pack Favorite (right) FIRST so it always keeps width and sits on the
+        # right edge — packing left expand-first used to steal space and clip
+        # the Favorite column (worse after the warranty toolbar button was added).
         right_frame = tk.Frame(main_frame, width=fs(230), bg="#f0f0f0", relief="groove", bd=1)
         right_frame.pack(side="right", fill="y")
         right_frame.pack_propagate(False)
 
+        left_frame = tk.Frame(main_frame)
+        left_frame.pack(side="left", fill="both", expand=True)
+
         # ---------------------------------------------------------- left: search + selected list
 
-        search_header = tk.Frame(left_frame)
-        search_header.pack(fill="x", **pad)
-        tk.Label(search_header, text="ค้นหายาที่บันทึกไว้แล้วดับเบิลคลิกเพื่อเพิ่มเข้ารายการ",
-                 font=("Tahoma", fs(10), "bold")).pack(side="left", anchor="w")
+        # แถวปุ่มชิดซ้าย (ไม่มีหัวข้อ "ค้นหายา" บนสุด — คำใบ้อยู่ในช่อง search)
+        toolbar = tk.Frame(left_frame)
+        toolbar.pack(fill="x", padx=fs(10), pady=(fs(6), fs(4)))
+        _tb = {"font": ("Tahoma", fs(9)), "padx": fs(3)}
         tk.Button(
-            search_header, text="⚙️ ตั้งค่า", font=("Tahoma", fs(9)),
-            command=lambda: build_settings_dialog(self.root),
-        ).pack(side="right")
-        tk.Button(
-            search_header, text="📥 Import จาก Excel", font=("Tahoma", fs(9)),
-            command=self.open_import_excel_dialog,
-        ).pack(side="right", padx=(0, fs(6)))
-        tk.Button(
-            search_header, text="📱 คิวจากมือถือ", font=("Tahoma", fs(9), "bold"),
-            bg="#5a5a9a", fg="white", command=self.open_queue_dialog,
-        ).pack(side="right", padx=(0, fs(6)))
-        tk.Button(
-            search_header, text="📜 แฟ้มประวัติการจ่ายยา", font=("Tahoma", fs(9)),
-            command=self.open_print_history_dialog,
-        ).pack(side="right", padx=(0, fs(6)))
-        tk.Button(
-            search_header, text="🗂 ประวัติผู้ป่วย", font=("Tahoma", fs(9)),
-            command=self.open_patient_profile_dialog,
-        ).pack(side="right", padx=(0, fs(6)))
-        tk.Button(
-            search_header, text="🤖 AI ช่วยค้นข้อมูล", font=("Tahoma", fs(9)),
+            toolbar, text="🤖 AI", font=_tb["font"],
             command=self.open_ai_assist_dialog,
-        ).pack(side="right", padx=(0, fs(6)))
+        ).pack(side="left", padx=(0, fs(4)))
+        tk.Button(
+            toolbar, text="🗂 ประวัติผู้ป่วย", font=_tb["font"],
+            command=self.open_patient_profile_dialog,
+        ).pack(side="left", padx=(0, fs(4)))
+        tk.Button(
+            toolbar, text="📜 แฟ้มประวัติ", font=_tb["font"],
+            command=self.open_print_history_dialog,
+        ).pack(side="left", padx=(0, fs(4)))
+        tk.Button(
+            toolbar, text="🛡 ประกัน", font=_tb["font"],
+            bg="#6a4a1a", fg="white", command=self.open_warranty_dialog,
+        ).pack(side="left", padx=(0, fs(4)))
+        tk.Button(
+            toolbar, text="📱 คิวมือถือ", font=_tb["font"],
+            bg="#5a5a9a", fg="white", command=self.open_queue_dialog,
+        ).pack(side="left", padx=(0, fs(4)))
+        tk.Button(
+            toolbar, text="📥 Import Excel", font=_tb["font"],
+            command=self.open_import_excel_dialog,
+        ).pack(side="left", padx=(0, fs(4)))
+        tk.Button(
+            toolbar, text="⚙️ ตั้งค่า", font=_tb["font"],
+            command=lambda: build_settings_dialog(self.root),
+        ).pack(side="left", padx=(0, fs(4)))
 
         search_row = tk.Frame(left_frame)
         search_row.pack(fill="x", **pad)
         self.search_var = tk.StringVar()
         self.search_var.trace_add("write", self.on_search_change)
-        search_entry = tk.Entry(search_row, textvariable=self.search_var, font=("Tahoma", fs(11)))
-        search_entry.pack(side="left", fill="x", expand=True)
-        search_entry.bind("<Return>", self.on_search_enter)
+        self.search_entry = tk.Entry(search_row, textvariable=self.search_var, font=("Tahoma", fs(11)))
+        self.search_entry.pack(side="left", fill="x", expand=True)
+        self.search_entry.bind("<Return>", self.on_search_enter)
+        # placeholder บางๆ ในช่อง search (Entry ธรรมดาไม่มี placeholder จริง)
+        self._search_placeholder = "ค้นหาหรือรหัส barcode"
+        self._search_placeholder_active = True
+        self.search_entry.insert(0, self._search_placeholder)
+        self.search_entry.config(fg="#999999")
+        self.search_entry.bind("<FocusIn>", self._search_focus_in)
+        self.search_entry.bind("<FocusOut>", self._search_focus_out)
         tk.Button(
             search_row, text="✕", font=("Tahoma", fs(9), "bold"), fg="white", bg="#555555", width=2,
-            command=lambda: self.search_var.set(""),
+            command=self.clear_search_box,
         ).pack(side="left", padx=(fs(4), 0))
         tk.Button(
             search_row, text="+ เพิ่มยาใหม่", font=("Tahoma", fs(9), "bold"),
@@ -1438,7 +1453,39 @@ class LabelApp:
 
     # ---------------------------------------------------------------- search
 
+    def _search_term(self):
+        """Actual search text — empty while the gray placeholder is showing."""
+        if getattr(self, "_search_placeholder_active", False):
+            return ""
+        return (self.search_var.get() or "").strip()
+
+    def _search_focus_in(self, _e=None):
+        if self._search_placeholder_active:
+            self.search_entry.delete(0, tk.END)
+            self.search_entry.config(fg="#000000")
+            self._search_placeholder_active = False
+
+    def _search_focus_out(self, _e=None):
+        if not self.search_var.get().strip():
+            self._show_search_placeholder()
+
+    def _show_search_placeholder(self):
+        self._search_placeholder_active = True
+        # avoid recursive trace noise while swapping text
+        self.search_entry.delete(0, tk.END)
+        self.search_entry.insert(0, self._search_placeholder)
+        self.search_entry.config(fg="#999999")
+
+    def clear_search_box(self):
+        self._search_placeholder_active = False
+        self.search_var.set("")
+        self._show_search_placeholder()
+        self.search_results = []
+        self._render_search_results()
+
     def on_search_change(self, *args):
+        if getattr(self, "_search_placeholder_active", False):
+            return
         if self._search_after_id:
             self.root.after_cancel(self._search_after_id)
         self._search_after_id = self.root.after(300, self.do_search)
@@ -1449,13 +1496,13 @@ class LabelApp:
         check "does this exactly match one barcode?" and skip straight to
         adding it, instead of making the pharmacist scan then still have to
         double-click a search result."""
-        term = self.search_var.get().strip()
+        term = self._search_term()
         if not term:
             return
         match = storage.find_template_by_barcode(term)
         if not match:
             return
-        self.search_var.set("")
+        self.clear_search_box()
 
         def worker():
             try:
@@ -1468,7 +1515,7 @@ class LabelApp:
         threading.Thread(target=worker, daemon=True).start()
 
     def do_search(self):
-        term = self.search_var.get().strip()
+        term = self._search_term()
         self.search_results = []
         self._render_search_results()
         if not term:
@@ -2749,6 +2796,30 @@ class LabelApp:
                 command=lambda: self._copy_queue_url(copied_var),
             ).pack(side="left", padx=(fs(4), 0))
 
+        warranty_url = (self.queue_url.rstrip("/") + "/warranty") if self.queue_url else ""
+        if warranty_url:
+            tk.Label(
+                win, text="ประกันอุปกรณ์ (มือถือ):",
+                font=("Tahoma", fs(8)), fg="#6a4a1a",
+            ).pack(anchor="w", padx=fs(10), pady=(fs(4), 0))
+            war_row = tk.Frame(win)
+            war_row.pack(fill="x", padx=fs(10), pady=(0, fs(2)))
+            war_var = tk.StringVar(value=warranty_url)
+            tk.Entry(
+                war_row, textvariable=war_var, font=("Tahoma", fs(10), "bold"), fg="#6a4a1a",
+                state="readonly", readonlybackground="white", relief="solid", bd=1,
+            ).pack(side="left", fill="x", expand=True, ipady=fs(2))
+
+            def _copy_war():
+                self.root.clipboard_clear()
+                self.root.clipboard_append(warranty_url)
+                copied_var.set(f"คัดลอก {warranty_url} แล้ว")
+
+            tk.Button(
+                war_row, text="📋", font=("Tahoma", fs(9)),
+                command=_copy_war,
+            ).pack(side="left", padx=(fs(4), 0))
+
         copied_var = tk.StringVar(value="")
         tk.Label(win, textvariable=copied_var, font=("Tahoma", fs(8)), fg="#0a7a2f").pack(
             anchor="w", padx=fs(10), pady=(0, fs(2))
@@ -3171,10 +3242,16 @@ class LabelApp:
     def open_patient_profile_dialog(self, preload_patient_id=None):
         win = tk.Toplevel(self.root)
         win.title("ประวัติผู้ป่วย")
-        win_w = fs(520)
-        win_h = min(fs(660), win.winfo_screenheight() - fs(80))
+        win_w = fs(540)
+        # เว้นขอบล่างจาก taskbar + เลื่อนทั้งหน้าได้เมื่อเนื้อหาล้น
+        bottom_gap = 58
+        max_h = max(fs(400), win.winfo_screenheight() - bottom_gap - fs(40))
+        win_h = min(fs(700), max_h)
         win_x = (win.winfo_screenwidth() - win_w) // 2
-        win_y = max(0, (win.winfo_screenheight() - win_h) // 2 - fs(20))
+        win_y = max(0, min(
+            (win.winfo_screenheight() - win_h) // 2 - fs(20),
+            win.winfo_screenheight() - win_h - bottom_gap,
+        ))
         win.geometry(f"{win_w}x{win_h}+{win_x}+{win_y}")
         win.transient(self.root)
         # No grab_set() - deliberately non-modal, so this can stay open at
@@ -3182,8 +3259,45 @@ class LabelApp:
         # between freely (e.g. to copy AI conversation text and paste it
         # into a patient document without closing this window first).
 
-        tk.Label(win, text="ค้นหาชื่อ/เบอร์โทร", font=("Tahoma", fs(10), "bold")).pack(anchor="w", padx=fs(10), pady=(fs(10), fs(2)))
-        search_row = tk.Frame(win)
+        # ---- scrollable body (เนื้อหาล้นหน้า — แพ้ยา / ซื้อ / ประกัน / เอกสาร) ----
+        shell = tk.Frame(win)
+        shell.pack(fill="both", expand=True)
+        vsb = tk.Scrollbar(shell, orient="vertical")
+        canvas = tk.Canvas(shell, highlightthickness=0, yscrollcommand=vsb.set)
+        vsb.config(command=canvas.yview)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        body = tk.Frame(canvas)
+        body_id = canvas.create_window((0, 0), window=body, anchor="nw")
+
+        def _body_configure(event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _canvas_configure(event):
+            canvas.itemconfig(body_id, width=max(1, event.width))
+
+        body.bind("<Configure>", _body_configure)
+        canvas.bind("<Configure>", _canvas_configure)
+
+        def _wheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        def _bind_wheel(_e=None):
+            canvas.bind_all("<MouseWheel>", _wheel)
+
+        def _unbind_wheel(_e=None):
+            try:
+                canvas.unbind_all("<MouseWheel>")
+            except Exception:
+                pass
+
+        canvas.bind("<Enter>", _bind_wheel)
+        canvas.bind("<Leave>", _unbind_wheel)
+        body.bind("<Enter>", _bind_wheel)
+        win.bind("<Destroy>", lambda e: _unbind_wheel() if e.widget is win else None)
+
+        tk.Label(body, text="ค้นหาชื่อ/เบอร์โทร", font=("Tahoma", fs(10), "bold")).pack(anchor="w", padx=fs(10), pady=(fs(10), fs(2)))
+        search_row = tk.Frame(body)
         search_row.pack(fill="x", padx=fs(10), pady=(0, fs(6)))
         search_var = tk.StringVar()
         search_entry = tk.Entry(search_row, textvariable=search_var, font=("Tahoma", fs(10)))
@@ -3198,34 +3312,50 @@ class LabelApp:
             command=lambda: self.open_all_hn_dialog(win, load_patient),
         ).pack(side="left", padx=(fs(4), 0))
 
-        result_list = tk.Listbox(win, font=("Tahoma", fs(9)), height=4, exportselection=False)
+        result_list = tk.Listbox(body, font=("Tahoma", fs(9)), height=4, exportselection=False)
         result_list.pack(fill="x", padx=fs(10), pady=(0, fs(8)))
 
-        divider = tk.Frame(win, height=2, bg="#ccc")
+        divider = tk.Frame(body, height=2, bg="#ccc")
         divider.pack(fill="x", padx=fs(10), pady=(0, fs(6)))
 
         patient_name_var = tk.StringVar(value="(ยังไม่ได้เลือกผู้ป่วย)")
-        tk.Label(win, textvariable=patient_name_var, font=("Tahoma", fs(13), "bold"), fg="#1a7a4a").pack(
+        tk.Label(body, textvariable=patient_name_var, font=("Tahoma", fs(13), "bold"), fg="#1a7a4a").pack(
             anchor="w", padx=fs(10), pady=(0, fs(4))
         )
 
-        tk.Label(win, text="ประวัติแพ้ยา", font=("Tahoma", fs(10), "bold")).pack(anchor="w", padx=fs(10))
+        tk.Label(body, text="ประวัติแพ้ยา", font=("Tahoma", fs(10), "bold")).pack(anchor="w", padx=fs(10))
         tk.Label(
-            win, text="(ถ้ามีหลายตัว ให้คั่นด้วย comma เช่น Amoxy, Diclofenac)",
+            body, text="(ถ้ามีหลายตัว ให้คั่นด้วย comma เช่น Amoxy, Diclofenac)",
             font=("Tahoma", fs(8)), fg="#777",
         ).pack(anchor="w", padx=fs(10))
-        allergy_text = tk.Text(win, font=("Tahoma", fs(10)), height=3, bd=1, relief="solid")
+        allergy_text = tk.Text(body, font=("Tahoma", fs(10)), height=3, bd=1, relief="solid")
         allergy_text.pack(fill="x", padx=fs(10), pady=(fs(2), fs(4)))
         tk.Button(
-            win, text="💾 บันทึกประวัติแพ้ยา", font=("Tahoma", fs(9), "bold"), bg="#1a7a4a", fg="white",
+            body, text="💾 บันทึกประวัติแพ้ยา", font=("Tahoma", fs(9), "bold"), bg="#1a7a4a", fg="white",
             command=lambda: save_allergy(),
         ).pack(anchor="w", padx=fs(10), pady=(0, fs(8)))
 
-        tk.Label(win, text="ประวัติการซื้อทั้งหมด", font=("Tahoma", fs(10), "bold")).pack(anchor="w", padx=fs(10))
-        purchase_list = tk.Listbox(win, font=("Tahoma", fs(9)), height=4, exportselection=False)
-        purchase_list.pack(fill="x", padx=fs(10), pady=(fs(2), fs(8)))
+        tk.Label(body, text="ประวัติการซื้อทั้งหมด", font=("Tahoma", fs(10), "bold")).pack(anchor="w", padx=fs(10))
+        purchase_list = tk.Listbox(body, font=("Tahoma", fs(9)), height=3, exportselection=False)
+        purchase_list.pack(fill="x", padx=fs(10), pady=(fs(2), fs(6)))
 
-        doc_header_row = tk.Frame(win)
+        war_header = tk.Frame(body)
+        war_header.pack(fill="x", padx=fs(10))
+        tk.Label(war_header, text="🛡 ประกันอุปกรณ์", font=("Tahoma", fs(10), "bold")).pack(side="left")
+        tk.Button(
+            war_header, text="＋ เพิ่มประกัน", font=("Tahoma", fs(8), "bold"), bg="#6a4a1a", fg="white",
+            command=lambda: add_warranty_ui(),
+        ).pack(side="right")
+        warranty_list = tk.Listbox(body, font=("Tahoma", fs(9)), height=3, exportselection=False)
+        warranty_list.pack(fill="x", padx=fs(10), pady=(fs(2), fs(4)))
+        war_btn_row = tk.Frame(body)
+        war_btn_row.pack(fill="x", padx=fs(10), pady=(0, fs(6)))
+        tk.Button(
+            war_btn_row, text="🗑 ลบรายการที่เลือก", font=("Tahoma", fs(8)),
+            command=lambda: delete_selected_warranty(),
+        ).pack(side="left")
+
+        doc_header_row = tk.Frame(body)
         doc_header_row.pack(fill="x", padx=fs(10))
         tk.Label(doc_header_row, text="เอกสารประกอบ (บันทึก/บทสนทนา/รูป)", font=("Tahoma", fs(10), "bold")).pack(side="left")
         tk.Button(
@@ -3233,8 +3363,10 @@ class LabelApp:
             command=lambda: upload_doc(),
         ).pack(side="right")
 
-        doc_list_outer = tk.Frame(win, bd=1, relief="solid")
-        doc_list_outer.pack(fill="both", expand=True, padx=fs(10), pady=(fs(2), fs(8)))
+        # ความสูงคงที่ — เลื่อนทั้งหน้าผ่าน scrollbar หลัก ไม่แย่ง expand
+        doc_list_outer = tk.Frame(body, bd=1, relief="solid", height=fs(140))
+        doc_list_outer.pack(fill="x", padx=fs(10), pady=(fs(2), fs(16)))
+        doc_list_outer.pack_propagate(False)
         doc_canvas = tk.Canvas(doc_list_outer, highlightthickness=0)
         doc_scroll = tk.Scrollbar(doc_list_outer, orient="vertical", command=doc_canvas.yview)
         doc_rows_frame = tk.Frame(doc_canvas)
@@ -3252,6 +3384,7 @@ class LabelApp:
         current_patient = {"id": None, "name": "", "phone": ""}
         results = []
         purchase_jobs = []
+        warranty_rows = []
         docs = []
 
         def format_when(iso_str):
@@ -3259,6 +3392,20 @@ class LabelApp:
                 return datetime.fromisoformat(iso_str).strftime("%d/%m/%Y %H:%M")
             except Exception:
                 return iso_str
+
+        def format_day(d):
+            """DD/MM/YY for purchase/expiry on warranty lines."""
+            return storage._format_date_dmy(d) or "-"
+
+        def days_left_label(expiry):
+            n = storage.warranty_days_left(expiry)
+            if n is None:
+                return ""
+            if n < 0:
+                return f"หมดแล้ว {abs(n)} วัน"
+            if n == 0:
+                return "หมดวันนี้"
+            return f"เหลือ {n} วัน"
 
         def load_patient(patient_id):
             p = storage.get_patient(patient_id)
@@ -3272,7 +3419,10 @@ class LabelApp:
             allergy_text.delete("1.0", "end")
             allergy_text.insert("1.0", p["allergy_note"])
             refresh_purchase_history()
+            refresh_warranties()
             refresh_documents()
+            win.update_idletasks()
+            _body_configure()
 
         def do_search():
             term = search_var.get().strip()
@@ -3294,6 +3444,8 @@ class LabelApp:
                     else:
                         pid = storage.find_or_create_patient(term, "")
                     load_patient(pid)
+            win.update_idletasks()
+            _body_configure()
 
         def on_result_select(event=None):
             sel = result_list.curselection()
@@ -3319,6 +3471,61 @@ class LabelApp:
                 if len(job["drugs"]) > 3:
                     drug_names += ", ..."
                 purchase_list.insert(tk.END, f"{when} - {drug_names}")
+
+        def refresh_warranties():
+            warranty_list.delete(0, tk.END)
+            warranty_rows.clear()
+            if not current_patient["id"]:
+                return
+            try:
+                rows = storage.list_warranties_for_patient(current_patient["id"])
+            except Exception as e:
+                warranty_list.insert(tk.END, f"(โหลดประกันไม่ได้: {e})")
+                return
+            warranty_rows.extend(rows)
+            if not rows:
+                warranty_list.insert(tk.END, "(ยังไม่มีรายการประกัน)")
+                return
+            for w in rows:
+                left = days_left_label(w.get("expiry_date"))
+                left_part = f" · {left}" if left else ""
+                buy = format_day(w.get("purchase_date"))
+                warranty_list.insert(
+                    tk.END,
+                    f"{w.get('product_name') or '-'} · ซื้อ {buy} · หมด {format_day(w.get('expiry_date'))}{left_part}",
+                )
+
+        def add_warranty_ui():
+            if not current_patient["id"]:
+                messagebox.showwarning("แจ้งเตือน", "กรุณาค้นหา/เลือกผู้ป่วยก่อน", parent=win)
+                return
+            self._open_warranty_form(
+                parent=win,
+                patient_id=current_patient["id"],
+                patient_label=patient_name_var.get(),
+                on_saved=refresh_warranties,
+            )
+
+        def delete_selected_warranty():
+            if not current_patient["id"]:
+                return
+            sel = warranty_list.curselection()
+            if not sel or not warranty_rows:
+                messagebox.showinfo("แจ้งเตือน", "เลือกรายการประกันก่อน", parent=win)
+                return
+            idx = sel[0]
+            if idx >= len(warranty_rows):
+                return
+            # skip placeholder row when list empty message was replaced wrongly
+            w = warranty_rows[idx]
+            if not messagebox.askyesno("ยืนยัน", f"ลบประกัน:\n{w.get('product_name')} ?", parent=win):
+                return
+            try:
+                storage.delete_warranty(w["id"])
+            except Exception as e:
+                messagebox.showerror("ลบไม่สำเร็จ", str(e), parent=win)
+                return
+            refresh_warranties()
 
         def save_allergy():
             if not current_patient["id"]:
@@ -3513,6 +3720,10 @@ class LabelApp:
 
         if preload_patient_id:
             load_patient(preload_patient_id)
+
+        # อัปเดต scrollregion หลังวาง widget ครบ
+        win.update_idletasks()
+        _body_configure()
 
         win.lift()
         win.focus_force()

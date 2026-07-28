@@ -3,10 +3,11 @@ POS integration needed. Each installation keeps its own drug list."""
 import io
 import json
 import os
+import re
 import shutil
 import sqlite3
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date as date_cls
 
 from PIL import Image
 
@@ -142,6 +143,32 @@ def _connect():
     conn.execute("CREATE INDEX IF NOT EXISTS idx_patients_name ON patients(name)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_patients_phone ON patients(phone)")
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_patients_hn_code ON patients(hn_code)")
+    # Device warranties (ประกันอุปกรณ์) — same concept as HOPE label_printer's
+    # Label_Warranties, but local SQLite so this standalone build stays
+    # independent of shop POS/SQL Server. patient_id FK → patients.id.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS warranties (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            patient_id INTEGER NOT NULL,
+            product_name TEXT NOT NULL,
+            seller TEXT,
+            seller_phone TEXT,
+            price REAL,
+            purchase_date TEXT,
+            warranty_years REAL,
+            expiry_date TEXT,
+            note TEXT,
+            external_id TEXT,
+            source TEXT,
+            created_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_warranties_patient ON warranties(patient_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_warranties_product ON warranties(product_name)")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_warranties_external "
+        "ON warranties(external_id) WHERE external_id IS NOT NULL AND external_id != ''"
+    )
     conn.execute("""
         CREATE TABLE IF NOT EXISTS patient_documents (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -831,12 +858,18 @@ def search_patients(term, limit=50):
         like = f"%{term}%"
         prefix_like = f"{term}%"
         rows = conn.execute(
-            "SELECT id, name, phone, allergy_note FROM patients "
+            "SELECT id, name, phone, allergy_note, hn_code FROM patients "
             "WHERE name LIKE ? OR phone LIKE ? "
             "ORDER BY CASE WHEN name LIKE ? OR phone LIKE ? THEN 0 ELSE 1 END, name LIMIT ?",
             (like, like, prefix_like, prefix_like, limit),
         ).fetchall()
-        return [{"id": r[0], "name": r[1], "phone": r[2] or "", "allergy_note": r[3] or ""} for r in rows]
+        return [
+            {
+                "id": r[0], "name": r[1], "phone": r[2] or "",
+                "allergy_note": r[3] or "", "hn_code": r[4] or "",
+            }
+            for r in rows
+        ]
     finally:
         conn.close()
 
@@ -1150,6 +1183,712 @@ def delete_patient_document(doc_id):
                 pass
             conn.execute("DELETE FROM patient_documents WHERE id = ?", (doc_id,))
             conn.commit()
+    finally:
+        conn.close()
+
+
+# ── Device warranties (ประกันอุปกรณ์) ──────────────────────────────────────
+
+
+def _normalize_phone_digits(phone):
+    return re.sub(r"[^0-9]", "", phone or "")
+
+
+def format_phone_th(phone):
+    """Thai phone display form 0xx-xxx-xxxx (10 digits). Handles +66 / 66."""
+    raw = (phone or "").strip()
+    if not raw:
+        return ""
+    digits = _normalize_phone_digits(raw)
+    if digits.startswith("66") and len(digits) >= 11:
+        digits = "0" + digits[2:]
+    if len(digits) == 10 and digits.startswith("0"):
+        return f"{digits[0:3]}-{digits[3:6]}-{digits[6:10]}"
+    if len(digits) == 9 and digits.startswith("0"):
+        return f"{digits[0:2]}-{digits[2:5]}-{digits[5:9]}"
+    return raw
+
+
+def update_patient_contact(patient_id, name, phone):
+    """Update name/phone; HN stays the same."""
+    name = (name or "").strip()
+    phone = format_phone_th(phone)
+    if not name and not phone:
+        raise ValueError("ต้องมีชื่อหรือเบอร์อย่างน้อยอย่างหนึ่ง")
+    if not name:
+        name = phone
+    conn = _connect()
+    try:
+        conn.execute(
+            "UPDATE patients SET name = ?, phone = ? WHERE id = ?",
+            (name, phone, int(patient_id)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _normalize_person_name(name):
+    n = re.sub(r"\s+", " ", (name or "").strip())
+    for prefix in ("คุณ", "นาย", "นางสาว", "น.ส.", "นาง", "เด็กชาย", "เด็กหญิง", "ด.ช.", "ด.ญ."):
+        if n.startswith(prefix):
+            n = n[len(prefix):].strip()
+            break
+    return n.casefold()
+
+
+def _names_compatible(a, b):
+    """True when names look like the same person — exact or near-full substring.
+    Rejects short-token traps like 'ทดสอบ' matching 'สุชาติ ทดสอบ 1'."""
+    na = _normalize_person_name(a)
+    nb = _normalize_person_name(b)
+    if not na or not nb:
+        return False
+    if na == nb:
+        return True
+    shorter, longer = (na, nb) if len(na) <= len(nb) else (nb, na)
+    if shorter in longer and len(shorter) >= max(6, int(len(longer) * 0.75)):
+        return True
+    return False
+
+
+def _parse_warranty_years(text):
+    s = (text or "").strip()
+    if not s:
+        return None
+    m = re.search(r"([\d.]+)\s*ปี", s)
+    if m:
+        try:
+            return float(m.group(1))
+        except ValueError:
+            return None
+    m = re.search(r"([\d.]+)\s*เดือน", s)
+    if m:
+        try:
+            return float(m.group(1)) / 12.0
+        except ValueError:
+            return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _parse_date_flexible(text):
+    s = (text or "").strip()
+    if not s:
+        return None
+    for cand in (s, s[:10], s[:8]):
+        if not cand:
+            continue
+        for fmt in ("%d/%m/%y", "%d/%m/%Y", "%Y-%m-%d", "%Y/%m/%d", "%d-%m-%y", "%d-%m-%Y"):
+            try:
+                return datetime.strptime(cand, fmt).date()
+            except ValueError:
+                continue
+    return None
+
+
+def _format_date_dmy(d):
+    if d is None or d == "":
+        return ""
+    try:
+        if hasattr(d, "strftime"):
+            return d.strftime("%d/%m/%y")
+        parsed = _parse_date_flexible(str(d))
+        return parsed.strftime("%d/%m/%y") if parsed else str(d)[:10]
+    except Exception:
+        return str(d)[:10]
+
+
+def _date_to_iso(d):
+    if d is None:
+        return None
+    if hasattr(d, "strftime"):
+        return d.strftime("%Y-%m-%d")
+    parsed = _parse_date_flexible(str(d))
+    return parsed.strftime("%Y-%m-%d") if parsed else None
+
+
+def _add_years_to_date(purchase, years):
+    if purchase is None or years is None:
+        return None
+    try:
+        years = float(years)
+    except (TypeError, ValueError):
+        return None
+    import calendar
+    if not isinstance(purchase, date_cls):
+        if hasattr(purchase, "date"):
+            try:
+                purchase = purchase.date()
+            except Exception:
+                return None
+        else:
+            return None
+    whole = int(years)
+    months_extra = int(round((years - whole) * 12))
+    y = purchase.year + whole
+    m = purchase.month + months_extra
+    while m > 12:
+        y += 1
+        m -= 12
+    while m < 1:
+        y -= 1
+        m += 12
+    day = min(purchase.day, calendar.monthrange(y, m)[1])
+    return date_cls(y, m, day)
+
+
+def _list_patients_for_match():
+    conn = _connect()
+    try:
+        rows = conn.execute("SELECT id, name, IFNULL(phone, '') FROM patients").fetchall()
+        return [{"id": r[0], "name": r[1], "phone": r[2] or ""} for r in rows]
+    finally:
+        conn.close()
+
+
+def find_or_create_patient_for_warranty(name, phone):
+    """Match flexible by phone digits / name; create patients (+ HN) if new.
+    Returns (patient_id, how).
+
+    If the typed name does not match anyone already on that phone, create a
+    NEW patient — never silently reuse another customer's name.
+    """
+    name = (name or "").strip()
+    phone = format_phone_th(phone)
+    if not name and not phone:
+        return None, "skip"
+    exact = find_patient_id(name, phone)
+    if exact:
+        return exact, "exact"
+    digits = _normalize_phone_digits(phone)
+    nn = _normalize_person_name(name)
+    patients = _list_patients_for_match()
+    if digits and len(digits) >= 9:
+        by_phone = [p for p in patients if _normalize_phone_digits(p["phone"]) == digits]
+        if by_phone:
+            if nn:
+                for p in by_phone:
+                    if _normalize_person_name(p["name"]) == nn:
+                        return p["id"], "phone+name"
+                for p in by_phone:
+                    if _names_compatible(p["name"], name):
+                        return p["id"], "phone+namefuzzy"
+                pid = find_or_create_patient(name, phone)
+                return pid, "created_phone_name_mismatch"
+            if len(by_phone) == 1:
+                return by_phone[0]["id"], "phone"
+            return by_phone[0]["id"], "phone_ambiguous"
+    if nn:
+        by_name = [p for p in patients if _normalize_person_name(p["name"]) == nn]
+        if len(by_name) == 1:
+            return by_name[0]["id"], "name"
+        if len(by_name) > 1 and digits:
+            for p in by_name:
+                if not _normalize_phone_digits(p["phone"]):
+                    return p["id"], "name_emptyphone"
+        fuzzy = [p for p in patients if _names_compatible(p["name"], name)]
+        if len(fuzzy) == 1:
+            return fuzzy[0]["id"], "namefuzzy"
+    pid = find_or_create_patient(name or phone, phone)
+    return pid, "created"
+
+
+def list_warranty_product_names(term="", limit=40):
+    """Product names seen in warranties — prefix first, then contain, newest first."""
+    term = (term or "").strip()
+    lim = max(1, min(int(limit), 100))
+    conn = _connect()
+    try:
+        if term:
+            like = f"%{term}%"
+            prefix = f"{term}%"
+            rows = conn.execute(
+                """
+                SELECT product_name FROM warranties
+                WHERE product_name LIKE ?
+                GROUP BY product_name
+                ORDER BY
+                  CASE WHEN product_name LIKE ? THEN 0 ELSE 1 END,
+                  MAX(id) DESC
+                LIMIT ?
+                """,
+                (like, prefix, lim),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT product_name FROM warranties
+                GROUP BY product_name
+                ORDER BY MAX(id) DESC
+                LIMIT ?
+                """,
+                (lim,),
+            ).fetchall()
+        return [r[0] for r in rows if r and r[0]]
+    finally:
+        conn.close()
+
+
+def get_latest_warranty_defaults(product_name):
+    name = (product_name or "").strip()
+    if not name:
+        return None
+    conn = _connect()
+    try:
+        row = conn.execute(
+            """
+            SELECT seller, seller_phone, price, warranty_years, note
+            FROM warranties
+            WHERE product_name = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (name,),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "seller": row[0] or "",
+            "seller_phone": row[1] or "",
+            "price": row[2],
+            "warranty_years": row[3],
+            "note": row[4] or "",
+        }
+    finally:
+        conn.close()
+
+
+def list_warranties(limit=500, expiring_within_days=None):
+    """All warranties, newest first (id DESC) — same default as HOPE desktop list.
+    Optional filter: expiry within N days (includes overdue)."""
+    lim = max(1, min(int(limit), 1000))
+    conn = _connect()
+    try:
+        if expiring_within_days is not None:
+            # SQLite date('now') is UTC-ish enough for day-level filter
+            days = int(expiring_within_days)
+            rows = conn.execute(
+                f"""
+                SELECT w.id, w.patient_id, w.product_name, w.seller, w.seller_phone,
+                       w.price, w.purchase_date, w.warranty_years, w.expiry_date, w.note,
+                       w.external_id, w.source, w.created_at,
+                       IFNULL(p.name, '') AS patient_name,
+                       IFNULL(p.phone, '') AS patient_phone,
+                       IFNULL(p.hn_code, '') AS hn_code
+                FROM warranties w
+                LEFT JOIN patients p ON p.id = w.patient_id
+                WHERE w.expiry_date IS NOT NULL AND w.expiry_date != ''
+                  AND date(w.expiry_date) <= date('now', '+{days} days')
+                ORDER BY date(w.expiry_date) ASC, w.id DESC
+                LIMIT {lim}
+                """
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                f"""
+                SELECT w.id, w.patient_id, w.product_name, w.seller, w.seller_phone,
+                       w.price, w.purchase_date, w.warranty_years, w.expiry_date, w.note,
+                       w.external_id, w.source, w.created_at,
+                       IFNULL(p.name, '') AS patient_name,
+                       IFNULL(p.phone, '') AS patient_phone,
+                       IFNULL(p.hn_code, '') AS hn_code
+                FROM warranties w
+                LEFT JOIN patients p ON p.id = w.patient_id
+                ORDER BY w.id DESC
+                LIMIT {lim}
+                """
+            ).fetchall()
+        cols = [
+            "id", "patient_id", "product_name", "seller", "seller_phone",
+            "price", "purchase_date", "warranty_years", "expiry_date", "note",
+            "external_id", "source", "created_at",
+            "patient_name", "patient_phone", "hn_code",
+        ]
+        return [dict(zip(cols, row)) for row in rows]
+    finally:
+        conn.close()
+
+
+def list_warranties_for_patient(patient_id, limit=200):
+    lim = max(1, min(int(limit), 500))
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT id, patient_id, product_name, seller, seller_phone,
+                   price, purchase_date, warranty_years, expiry_date, note,
+                   external_id, source, created_at
+            FROM warranties
+            WHERE patient_id = ?
+            ORDER BY
+              CASE WHEN expiry_date IS NULL OR expiry_date = '' THEN 1 ELSE 0 END,
+              expiry_date ASC, id DESC
+            LIMIT {lim}
+            """,
+            (int(patient_id),),
+        ).fetchall()
+        cols = [
+            "id", "patient_id", "product_name", "seller", "seller_phone",
+            "price", "purchase_date", "warranty_years", "expiry_date", "note",
+            "external_id", "source", "created_at",
+        ]
+        return [dict(zip(cols, row)) for row in rows]
+    finally:
+        conn.close()
+
+
+def add_warranty(
+    patient_id,
+    product_name,
+    seller=None,
+    seller_phone=None,
+    price=None,
+    purchase_date=None,
+    warranty_years=None,
+    expiry_date=None,
+    note=None,
+    external_id=None,
+    source="manual",
+):
+    product_name = (product_name or "").strip()
+    if not patient_id or not product_name:
+        raise ValueError("ต้องมี patient_id และชื่อสินค้า")
+    try:
+        price_f = float(price) if price not in (None, "") else None
+    except (TypeError, ValueError):
+        price_f = None
+    try:
+        years_f = float(warranty_years) if warranty_years not in (None, "") else None
+    except (TypeError, ValueError):
+        years_f = _parse_warranty_years(str(warranty_years or ""))
+
+    def _to_iso(val):
+        if val is None or val == "":
+            return None
+        if isinstance(val, str):
+            if re.match(r"^\d{4}-\d{2}-\d{2}", val):
+                return val[:10]
+            return _date_to_iso(_parse_date_flexible(val))
+        return _date_to_iso(val)
+
+    purchase_iso = _to_iso(purchase_date)
+    expiry_iso = _to_iso(expiry_date)
+    if expiry_iso is None and purchase_iso and years_f is not None:
+        pur = _parse_date_flexible(purchase_iso)
+        exp = _add_years_to_date(pur, years_f)
+        expiry_iso = _date_to_iso(exp)
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            """
+            INSERT INTO warranties (
+                patient_id, product_name, seller, seller_phone, price,
+                purchase_date, warranty_years, expiry_date, note, external_id, source, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(patient_id),
+                product_name,
+                (seller or "").strip() or None,
+                format_phone_th(seller_phone) or None,
+                price_f,
+                purchase_iso,
+                years_f,
+                expiry_iso,
+                (note or "").strip() or None,
+                (external_id or "").strip() or None,
+                (source or "manual").strip() or "manual",
+                datetime.now().isoformat(),
+            ),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+    finally:
+        conn.close()
+
+
+def warranty_days_left(expiry):
+    """Days until expiry (negative = overdue), or None if unknown."""
+    if expiry is None or expiry == "":
+        return None
+    d = expiry
+    if isinstance(d, datetime):
+        d = d.date()
+    elif isinstance(d, str):
+        d = _parse_date_flexible(d)
+    if d is None or not hasattr(d, "toordinal"):
+        return None
+    return (d - date_cls.today()).days
+
+
+def delete_warranty(warranty_id):
+    conn = _connect()
+    try:
+        conn.execute("DELETE FROM warranties WHERE id = ?", (int(warranty_id),))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def update_warranty(warranty_id, **fields):
+    allowed = {
+        "product_name", "seller", "seller_phone", "price", "purchase_date",
+        "warranty_years", "expiry_date", "note", "patient_id",
+    }
+    sets = []
+    vals = []
+    for k, v in fields.items():
+        if k not in allowed:
+            continue
+        if k in ("purchase_date", "expiry_date"):
+            if isinstance(v, str) and v:
+                if re.match(r"^\d{4}-\d{2}-\d{2}", v):
+                    v = v[:10]
+                else:
+                    v = _date_to_iso(_parse_date_flexible(v))
+            elif v is not None:
+                v = _date_to_iso(v)
+        elif k in ("price", "warranty_years"):
+            try:
+                v = float(v) if v not in (None, "") else None
+            except (TypeError, ValueError):
+                v = None
+        elif k == "patient_id" and v is not None:
+            v = int(v)
+        elif k == "seller_phone" and v is not None:
+            v = format_phone_th(v) or None
+        sets.append(f"{k} = ?")
+        vals.append(v)
+    if not sets:
+        return
+    vals.append(int(warranty_id))
+    conn = _connect()
+    try:
+        conn.execute(
+            f"UPDATE warranties SET {', '.join(sets)} WHERE id = ?",
+            tuple(vals),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def warranty_exists_external_id(external_id):
+    if not external_id:
+        return False
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM warranties WHERE external_id = ? LIMIT 1",
+            (external_id,),
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
+def _warranty_external_id_from_row(product, customer, phone, purchase, price, expiry):
+    raw = "|".join([
+        (product or "").strip(),
+        (customer or "").strip(),
+        _normalize_phone_digits(phone),
+        (purchase or "").strip()[:10],
+        (price or "").strip(),
+        (expiry or "").strip()[:10],
+    ])
+    return ("csv:" + raw)[:120]
+
+
+def import_warranties_from_csv(csv_path):
+    """Import warranty_tracker export CSV into patients + warranties.
+    Idempotent on external_id. Returns summary dict."""
+    import csv as csv_mod
+
+    report = {
+        "path": csv_path,
+        "rows": 0,
+        "inserted": 0,
+        "skipped_dup": 0,
+        "skipped_bad": 0,
+        "patients_created": 0,
+        "patients_matched": 0,
+        "errors": [],
+        "details": [],
+    }
+    if not os.path.isfile(csv_path):
+        report["errors"].append(f"ไม่พบไฟล์: {csv_path}")
+        return report
+
+    with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+        reader = csv_mod.DictReader(f)
+        raw_rows = list(reader)
+    report["rows"] = len(raw_rows)
+
+    def phone_key(r):
+        return 0 if _normalize_phone_digits(r.get("เบอร์โทร") or r.get("phone") or "") else 1
+
+    raw_rows.sort(key=phone_key)
+
+    for r in raw_rows:
+        product = (r.get("ชื่อสินค้า") or r.get("name") or "").strip()
+        customer = (r.get("ชื่อลูกค้า") or r.get("customer") or "").strip()
+        phone = (r.get("เบอร์โทร") or r.get("phone") or "").strip()
+        seller = (r.get("ซื้อสินค้ามาจาก") or r.get("seller") or "").strip()
+        seller_phone = (r.get("เบอร์โทรร้านค้า") or r.get("sellerPhone") or "").strip()
+        price_s = (r.get("ราคา") or r.get("price") or "").strip()
+        purchase_s = (r.get("วันที่ซื้อ") or r.get("purchase") or "").strip()
+        years_s = (r.get("ระยะประกัน") or r.get("years") or "").strip()
+        expiry_s = (r.get("วันหมดประกัน") or r.get("expiry") or "").strip()
+        note = (r.get("หมายเหตุ") or r.get("note") or "").strip()
+        note = note.replace("\r\n", "\n").replace("\r", "\n")
+
+        if not product or not customer:
+            report["skipped_bad"] += 1
+            report["details"].append({"product": product, "customer": customer, "status": "bad_row"})
+            continue
+
+        ext = _warranty_external_id_from_row(product, customer, phone, purchase_s, price_s, expiry_s)
+        if warranty_exists_external_id(ext):
+            report["skipped_dup"] += 1
+            report["details"].append({"product": product, "customer": customer, "status": "dup", "external_id": ext})
+            continue
+
+        try:
+            pid, how = find_or_create_patient_for_warranty(customer, phone)
+            if not pid:
+                report["skipped_bad"] += 1
+                continue
+            if how in ("created", "created_phone_name_mismatch"):
+                report["patients_created"] += 1
+            else:
+                report["patients_matched"] += 1
+
+            price = None
+            if price_s:
+                try:
+                    price = float(price_s.replace(",", ""))
+                except ValueError:
+                    price = None
+            years = _parse_warranty_years(years_s)
+            purchase_date = _parse_date_flexible(purchase_s)
+            expiry_date = _parse_date_flexible(expiry_s)
+
+            wid = add_warranty(
+                patient_id=pid,
+                product_name=product,
+                seller=seller,
+                seller_phone=seller_phone,
+                price=price,
+                purchase_date=purchase_date,
+                warranty_years=years,
+                expiry_date=expiry_date,
+                note=note,
+                external_id=ext,
+                source="import_csv",
+            )
+            report["inserted"] += 1
+            report["details"].append({
+                "product": product,
+                "customer": customer,
+                "status": "inserted",
+                "patient_id": pid,
+                "how": how,
+                "warranty_id": wid,
+            })
+        except Exception as e:
+            report["errors"].append(f"{customer} / {product}: {e}")
+            report["details"].append({
+                "product": product, "customer": customer, "status": "error", "error": str(e),
+            })
+
+    return report
+
+
+def count_warranties():
+    conn = _connect()
+    try:
+        return int(conn.execute("SELECT COUNT(*) FROM warranties").fetchone()[0])
+    finally:
+        conn.close()
+
+
+def clear_all_warranties(also_orphan_patients=False):
+    """Delete every warranty row. If also_orphan_patients, also delete patients
+    who have no print_jobs and no remaining warranties (import/test cleanup
+    without wiping real label-print customers).
+
+    Returns dict: warranties_deleted, patients_deleted.
+    """
+    conn = _connect()
+    try:
+        n_w = conn.execute("SELECT COUNT(*) FROM warranties").fetchone()[0]
+        conn.execute("DELETE FROM warranties")
+        n_p = 0
+        if also_orphan_patients:
+            # patients with no warranties (all gone) and no print history link
+            orphan_ids = [
+                r[0] for r in conn.execute(
+                    """
+                    SELECT p.id FROM patients p
+                    WHERE NOT EXISTS (SELECT 1 FROM warranties w WHERE w.patient_id = p.id)
+                      AND NOT EXISTS (SELECT 1 FROM print_jobs j WHERE j.patient_id = p.id)
+                      AND NOT EXISTS (
+                        SELECT 1 FROM print_jobs j2
+                        WHERE j2.patient_name = p.name
+                          AND IFNULL(j2.customer_phone, '') = IFNULL(p.phone, '')
+                      )
+                    """
+                ).fetchall()
+            ]
+            for pid in orphan_ids:
+                # remove docs on disk
+                patient_dir = os.path.join(PATIENT_DOCS_DIR, str(pid))
+                if os.path.isdir(patient_dir):
+                    shutil.rmtree(patient_dir, ignore_errors=True)
+                conn.execute("DELETE FROM patient_documents WHERE patient_id = ?", (pid,))
+                conn.execute("DELETE FROM patients WHERE id = ?", (pid,))
+                n_p += 1
+        conn.commit()
+        return {"warranties_deleted": int(n_w), "patients_deleted": int(n_p)}
+    finally:
+        conn.close()
+
+
+def clear_imported_and_test_warranties(also_orphan_patients=True):
+    """Remove warranties from import_csv / test sources only (keep real mobile/manual).
+    Useful after loading CSV for a dry-run before shipping to a customer shop."""
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT id, patient_id FROM warranties WHERE source IN ('import_csv', 'test')"
+        ).fetchall()
+        n_w = len(rows)
+        patient_ids = {r[1] for r in rows if r[1]}
+        conn.execute("DELETE FROM warranties WHERE source IN ('import_csv', 'test')")
+        n_p = 0
+        if also_orphan_patients and patient_ids:
+            for pid in patient_ids:
+                still = conn.execute(
+                    "SELECT 1 FROM warranties WHERE patient_id = ? LIMIT 1", (pid,)
+                ).fetchone()
+                if still:
+                    continue
+                job = conn.execute(
+                    "SELECT 1 FROM print_jobs WHERE patient_id = ? LIMIT 1", (pid,)
+                ).fetchone()
+                if job:
+                    continue
+                patient_dir = os.path.join(PATIENT_DOCS_DIR, str(pid))
+                if os.path.isdir(patient_dir):
+                    shutil.rmtree(patient_dir, ignore_errors=True)
+                conn.execute("DELETE FROM patient_documents WHERE patient_id = ?", (pid,))
+                conn.execute("DELETE FROM patients WHERE id = ?", (pid,))
+                n_p += 1
+        conn.commit()
+        return {"warranties_deleted": n_w, "patients_deleted": n_p}
     finally:
         conn.close()
 

@@ -1,0 +1,605 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>ประกันอุปกรณ์</title>
+<style>
+  :root { --primary:#6a4a1a; --ok:#1a7a4a; --text:#1a1a2e; --muted:#6b7280; --border:#e5e7eb; --bg:#f7f5f1; --danger:#dc2626; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:'Segoe UI',Tahoma,sans-serif; background:var(--bg); color:var(--text); padding-bottom:40px; }
+  .topbar { background:#fff; padding:14px 16px; border-bottom:1px solid var(--border); display:flex; align-items:center; gap:10px; position:sticky; top:0; z-index:50; }
+  .topbar-title { font-size:17px; font-weight:700; color:var(--primary); flex:1; }
+  .back-link { font-size:14px; font-weight:700; color:var(--muted); text-decoration:none; }
+  .section { padding:14px 16px; }
+  .card { background:#fff; border:1px solid var(--border); border-radius:12px; padding:14px; margin-bottom:12px; }
+  .card-title { font-size:14px; font-weight:700; color:var(--primary); margin:0 0 10px; }
+  .label { font-size:12px; font-weight:700; color:var(--muted); margin:8px 0 4px; display:block; }
+  input, textarea { width:100%; padding:12px; font-size:16px; border:1.5px solid var(--border); border-radius:10px; font-family:inherit; }
+  textarea { min-height:64px; resize:vertical; }
+  .row2 { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+  .search-row { display:flex; gap:8px; }
+  .search-row input { flex:1; }
+  .btn { border:none; border-radius:10px; font-weight:700; font-size:14px; padding:12px 14px; cursor:pointer; }
+  .btn-primary { background:var(--primary); color:#fff; }
+  .btn-ok { background:var(--ok); color:#fff; }
+  .btn-muted { background:#e5e7eb; color:var(--text); }
+  .btn-block { width:100%; margin-top:10px; }
+  .hint { font-size:12px; color:var(--muted); margin-top:6px; line-height:1.4; }
+  .result-item { padding:12px; border:1px solid var(--border); border-radius:10px; margin-top:6px; background:#fafafa; cursor:pointer; }
+  .result-item:active { background:#f0ebe3; }
+  .result-item .n { font-weight:700; font-size:15px; }
+  .result-item .m { font-size:12px; color:var(--muted); margin-top:2px; }
+  .chip { display:inline-block; background:#f0ebe3; color:var(--primary); font-size:12px; font-weight:700; padding:4px 10px; border-radius:999px; margin-top:8px; }
+  .chip.ok { background:#e8f5ee; color:var(--ok); }
+  .product-hits { border:1px solid var(--border); border-radius:10px; margin-top:6px; max-height:180px; overflow-y:auto; display:none; background:#fff; }
+  .product-hits.show { display:block; }
+  .product-hits div { padding:11px 12px; border-bottom:1px solid var(--border); font-size:14px; cursor:pointer; }
+  .product-hits div:last-child { border-bottom:none; }
+  .product-hits div:active { background:#f7f5f1; }
+  #toast { position:fixed; left:50%; bottom:24px; transform:translateX(-50%) translateY(20px); background:#1a1a2e; color:#fff; padding:12px 18px; border-radius:10px; font-size:14px; z-index:300; opacity:0; pointer-events:none; transition:all .25s; max-width:90vw; text-align:center; }
+  #toast.show { opacity:1; transform:translateX(-50%) translateY(0); }
+  .selected-box { background:#f0ebe3; border:1.5px solid #c4a574; border-radius:10px; padding:10px 12px; margin-top:8px; display:none; }
+  .selected-box.show { display:block; }
+  /* confirm review modal */
+  .modal-overlay {
+    display:none; position:fixed; inset:0; background:rgba(0,0,0,.45);
+    z-index:200; align-items:flex-end; justify-content:center; padding:12px;
+  }
+  .modal-overlay.show { display:flex; }
+  .modal-sheet {
+    background:#fff; border-radius:16px 16px 12px 12px; width:100%; max-width:480px;
+    max-height:88vh; overflow-y:auto; box-shadow:0 -4px 24px rgba(0,0,0,.18);
+    padding:16px 16px 20px;
+  }
+  .modal-title { font-size:18px; font-weight:800; color:var(--primary); margin:0 0 4px; }
+  .modal-sub { font-size:13px; color:var(--muted); margin:0 0 12px; }
+  .review-table { width:100%; border-collapse:collapse; font-size:14px; }
+  .review-table th {
+    text-align:left; font-size:11px; font-weight:700; color:var(--muted);
+    padding:8px 0 2px; width:34%; vertical-align:top; white-space:nowrap;
+  }
+  .review-table td {
+    padding:8px 0 2px; font-weight:600; color:var(--text); word-break:break-word;
+  }
+  .review-table tr + tr th, .review-table tr + tr td { border-top:1px solid var(--border); }
+  .modal-actions { display:grid; grid-template-columns:1fr 1.2fr; gap:8px; margin-top:16px; }
+  .modal-actions .btn { padding:14px 12px; font-size:15px; }
+  .btn-danger-outline { background:#fff; color:var(--danger); border:1.5px solid #fca5a5; }
+  .btn-outline {
+    background:#fff; color:var(--primary); border:1.5px solid #c4a574;
+  }
+  /* history list (like desktop warranty table) */
+  .hist-overlay {
+    display:none; position:fixed; inset:0; background:rgba(0,0,0,.45);
+    z-index:210; align-items:flex-end; justify-content:center; padding:0;
+  }
+  .hist-overlay.show { display:flex; }
+  .hist-sheet {
+    background:var(--bg); border-radius:16px 16px 0 0; width:100%; max-width:560px;
+    height:92vh; max-height:92vh; display:flex; flex-direction:column;
+    box-shadow:0 -4px 24px rgba(0,0,0,.18);
+  }
+  .hist-head {
+    background:#fff; padding:14px 16px; border-bottom:1px solid var(--border);
+    display:flex; align-items:center; gap:10px; border-radius:16px 16px 0 0;
+    flex-shrink:0;
+  }
+  .hist-head .title { font-size:17px; font-weight:800; color:var(--primary); flex:1; }
+  .hist-body { flex:1; overflow-y:auto; -webkit-overflow-scrolling:touch; padding:12px 14px 24px; }
+  .hist-card {
+    background:#fff; border:1px solid var(--border); border-radius:12px;
+    padding:12px 14px; margin-bottom:8px;
+  }
+  .hist-card .prod { font-size:15px; font-weight:800; color:var(--text); margin:0 0 4px; }
+  .hist-card .cust { font-size:14px; font-weight:600; color:var(--primary); }
+  .hist-card .meta { font-size:12px; color:var(--muted); margin-top:4px; line-height:1.45; }
+  .hist-card .row-meta {
+    display:flex; flex-wrap:wrap; gap:6px 12px; margin-top:8px;
+    font-size:12px; font-weight:600;
+  }
+  .hist-card .tag {
+    background:#f0ebe3; color:var(--primary); padding:3px 8px; border-radius:999px;
+    font-size:11px; font-weight:700;
+  }
+  .hist-card .tag.warn { background:#fef3c7; color:#b45309; }
+  .hist-card .tag.bad { background:#fee2e2; color:#b91c1c; }
+  .hist-card .tag.ok { background:#e8f5ee; color:var(--ok); }
+  .hist-empty { text-align:center; color:var(--muted); padding:40px 16px; font-size:14px; }
+  .hist-count { font-size:12px; color:var(--muted); font-weight:600; }
+</style>
+</head>
+<body>
+<div class="topbar">
+  <a class="back-link" href="/">← คิวพิมพ์</a>
+  <div class="topbar-title">🛡 ประกันอุปกรณ์</div>
+</div>
+
+<div class="section">
+  <!-- 1) ลูกค้า -->
+  <div class="card">
+    <div class="card-title">1) ลูกค้า (ชื่อ หรือ เบอร์โทร)</div>
+    <div class="search-row">
+      <input type="text" id="cust-q" placeholder="ค้นหาชื่อ หรือ 081-xxx-xxxx" autocomplete="off">
+      <button class="btn btn-primary" type="button" onclick="searchCustomer()">ค้นหา</button>
+    </div>
+    <div class="hint">เจอ = เลือกลูกค้า · ไม่เจอ = กรอกชื่อ/เบอร์ด้านล่างแล้วระบบสร้างใหม่ตอนบันทึก</div>
+    <div id="cust-results"></div>
+    <div class="selected-box" id="cust-selected">
+      <div style="font-weight:700" id="cust-selected-name"></div>
+      <div class="hint" id="cust-selected-meta"></div>
+      <button class="btn btn-muted btn-block" type="button" onclick="clearCustomer()">เปลี่ยนลูกค้า</button>
+    </div>
+    <div id="cust-manual" style="margin-top:10px">
+      <label class="label">ชื่อลูกค้า</label>
+      <input type="text" id="cust-name" placeholder="ชื่อ-นามสกุล" autocomplete="name">
+      <label class="label">เบอร์โทร</label>
+      <input type="tel" id="cust-phone" placeholder="081-xxx-xxxx" inputmode="tel" autocomplete="tel">
+      <div class="hint">เบอร์จะจัดเป็น 0xx-xxx-xxxx อัตโนมัติ</div>
+    </div>
+  </div>
+
+  <!-- 2) อุปกรณ์ -->
+  <div class="card">
+    <div class="card-title">2) อุปกรณ์ / ประกัน</div>
+    <label class="label">ชื่อสินค้า *</label>
+    <input type="text" id="product" placeholder="พิมพ์เพื่อค้นหา เช่น yuwell / omron" autocomplete="off">
+    <div class="product-hits" id="product-hits"></div>
+    <div class="hint">เลือกจากรายการ = เติม ซื้อจาก / เบอร์ร้าน / ราคา / ปีประกัน ตามครั้งล่าสุด</div>
+
+    <label class="label">ซื้อจาก</label>
+    <input type="text" id="seller" placeholder="ร้าน / ตัวแทน">
+
+    <label class="label">เบอร์ร้าน</label>
+    <input type="tel" id="seller-phone" placeholder="0xx-xxx-xxxx" inputmode="tel">
+
+    <div class="row2">
+      <div>
+        <label class="label">ราคา</label>
+        <input type="number" id="price" inputmode="decimal" placeholder="0">
+      </div>
+      <div>
+        <label class="label">ปีประกัน</label>
+        <input type="number" id="years" inputmode="decimal" step="0.5" placeholder="1">
+      </div>
+    </div>
+
+    <div class="row2">
+      <div>
+        <label class="label">วันซื้อ (DD/MM/YY)</label>
+        <input type="text" id="purchase" placeholder="28/07/26" inputmode="numeric">
+      </div>
+      <div>
+        <label class="label">วันหมดประกัน</label>
+        <input type="text" id="expiry" placeholder="คำนวณอัตโนมัติ" inputmode="numeric">
+      </div>
+    </div>
+    <div class="hint">วันหมด = วันซื้อ + ปีประกัน (แก้เองได้)</div>
+
+    <label class="label">หมายเหตุ</label>
+    <textarea id="note" placeholder="serial / lot / อื่นๆ"></textarea>
+
+    <button class="btn btn-ok btn-block" type="button" id="save-btn" onclick="openConfirmSave()">💾 บันทึกประกัน</button>
+    <button class="btn btn-outline btn-block" type="button" id="hist-btn" onclick="openWarrantyHistory()">📋 ดูประวัติ warranty</button>
+    <div class="hint" style="text-align:center">กดบันทึก → ทวนข้อมูล → ยืนยัน · ลงรายการถัดไปได้ต่อ</div>
+  </div>
+</div>
+
+<!-- ทวนข้อมูลก่อนบันทึก -->
+<div class="modal-overlay" id="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="confirm-title">
+  <div class="modal-sheet" onclick="event.stopPropagation()">
+    <div class="modal-title" id="confirm-title">ทวนข้อมูลก่อนบันทึก</div>
+    <p class="modal-sub">ตรวจชื่อลูกค้า / สินค้า / วันประกัน ให้ถูกต้อง แล้วกดยืนยัน</p>
+    <table class="review-table" id="confirm-review"></table>
+    <div class="modal-actions">
+      <button class="btn btn-danger-outline" type="button" id="confirm-cancel" onclick="closeConfirmSave()">← แก้</button>
+      <button class="btn btn-ok" type="button" id="confirm-ok" onclick="confirmAndSave()">✓ ยืนยันบันทึก</button>
+    </div>
+  </div>
+</div>
+
+<!-- ประวัติ warranty (เรียงใหม่สุดบน เหมือน desktop) -->
+<div class="hist-overlay" id="hist-modal" role="dialog" aria-modal="true" aria-labelledby="hist-title">
+  <div class="hist-sheet" onclick="event.stopPropagation()">
+    <div class="hist-head">
+      <button class="btn btn-muted" type="button" onclick="closeWarrantyHistory()" style="padding:10px 12px">← ปิด</button>
+      <div class="title" id="hist-title">📋 ประวัติประกัน</div>
+      <span class="hist-count" id="hist-count"></span>
+    </div>
+    <div class="hist-body" id="hist-list">
+      <div class="hist-empty">กำลังโหลด...</div>
+    </div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+var selectedPatientId = null;
+var productTimer = null;
+
+function toast(msg) {
+  var el = document.getElementById('toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  setTimeout(function(){ el.classList.remove('show'); }, 2200);
+}
+
+function todayDMY() {
+  var d = new Date();
+  var dd = ('0'+d.getDate()).slice(-2);
+  var mm = ('0'+(d.getMonth()+1)).slice(-2);
+  var yy = String(d.getFullYear()).slice(-2);
+  return dd+'/'+mm+'/'+yy;
+}
+document.getElementById('purchase').value = todayDMY();
+
+function formatPhoneLocal(s) {
+  var dig = String(s||'').replace(/\D/g,'');
+  if (dig.indexOf('66')===0 && dig.length>=11) dig = '0'+dig.slice(2);
+  if (dig.length===10 && dig[0]==='0') return dig.slice(0,3)+'-'+dig.slice(3,6)+'-'+dig.slice(6);
+  if (dig.length===9 && dig[0]==='0') return dig.slice(0,2)+'-'+dig.slice(2,5)+'-'+dig.slice(5);
+  return s||'';
+}
+document.getElementById('cust-phone').addEventListener('blur', function(){
+  this.value = formatPhoneLocal(this.value);
+});
+document.getElementById('seller-phone').addEventListener('blur', function(){
+  this.value = formatPhoneLocal(this.value);
+});
+
+function parseDMY(s) {
+  s = String(s||'').trim();
+  var m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})$/);
+  if (!m) return null;
+  var d = parseInt(m[1],10), mo = parseInt(m[2],10)-1, y = parseInt(m[3],10);
+  if (y < 100) y += 2000;
+  var dt = new Date(y, mo, d);
+  if (dt.getFullYear()!==y || dt.getMonth()!==mo || dt.getDate()!==d) return null;
+  return dt;
+}
+function fmtDMY(dt) {
+  if (!dt) return '';
+  var dd = ('0'+dt.getDate()).slice(-2);
+  var mm = ('0'+(dt.getMonth()+1)).slice(-2);
+  var yy = String(dt.getFullYear()).slice(-2);
+  return dd+'/'+mm+'/'+yy;
+}
+function addYears(dt, years) {
+  if (!dt || years==null || years==='') return null;
+  years = parseFloat(years);
+  if (isNaN(years)) return null;
+  var whole = Math.floor(years);
+  var monthsExtra = Math.round((years-whole)*12);
+  var y = dt.getFullYear()+whole;
+  var m = dt.getMonth()+monthsExtra;
+  while (m>11){ y++; m-=12; }
+  while (m<0){ y--; m+=12; }
+  var day = dt.getDate();
+  var last = new Date(y, m+1, 0).getDate();
+  return new Date(y, m, Math.min(day, last));
+}
+function recomputeExpiry() {
+  var p = parseDMY(document.getElementById('purchase').value);
+  var y = document.getElementById('years').value;
+  var exp = addYears(p, y);
+  if (exp) document.getElementById('expiry').value = fmtDMY(exp);
+}
+document.getElementById('purchase').addEventListener('blur', function(){
+  var p = parseDMY(this.value);
+  if (p) this.value = fmtDMY(p);
+  recomputeExpiry();
+});
+document.getElementById('years').addEventListener('input', recomputeExpiry);
+document.getElementById('years').addEventListener('blur', recomputeExpiry);
+
+function searchCustomer() {
+  var q = document.getElementById('cust-q').value.trim();
+  var box = document.getElementById('cust-results');
+  if (!q) { box.innerHTML = '<div class="hint">ใส่ชื่อหรือเบอร์ก่อน</div>'; return; }
+  box.innerHTML = '<div class="hint">กำลังค้นหา...</div>';
+  fetch('/api/patients?q=' + encodeURIComponent(q))
+    .then(function(r){ return r.json(); })
+    .then(function(list){
+      if (!list || !list.length) {
+        box.innerHTML = '<div class="hint">ไม่พบ — กรอกชื่อ/เบอร์ด้านล่าง แล้วบันทึก (จะสร้างลูกค้าใหม่)</div>';
+        // เดาว่า q เป็นเบอร์หรือชื่อ
+        var dig = q.replace(/\D/g,'');
+        if (dig.length >= 9) {
+          document.getElementById('cust-phone').value = formatPhoneLocal(q);
+        } else {
+          document.getElementById('cust-name').value = q;
+        }
+        return;
+      }
+      box.innerHTML = '';
+      list.forEach(function(p){
+        var el = document.createElement('div');
+        el.className = 'result-item';
+        el.innerHTML = '<div class="n">'+esc(p.name||'')+'</div><div class="m">'
+          +esc(p.phone||'')+(p.hn_code? ' · HN '+esc(p.hn_code):'')+'</div>';
+        el.onclick = function(){ selectCustomer(p); };
+        box.appendChild(el);
+      });
+    })
+    .catch(function(){ box.innerHTML = '<div class="hint">เชื่อมต่อไม่ได้</div>'; });
+}
+function esc(s){ return String(s||'').replace(/[&<>"']/g, function(c){ return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]); }); }
+
+function selectCustomer(p) {
+  selectedPatientId = p.id;
+  document.getElementById('cust-name').value = p.name || '';
+  document.getElementById('cust-phone').value = formatPhoneLocal(p.phone||'') || (p.phone||'');
+  document.getElementById('cust-selected-name').textContent = p.name || '(ไม่มีชื่อ)';
+  document.getElementById('cust-selected-meta').textContent =
+    (p.phone||'') + (p.hn_code ? ' · HN '+p.hn_code : '') + ' · เลือกลูกค้าเดิมแล้ว';
+  document.getElementById('cust-selected').classList.add('show');
+  document.getElementById('cust-results').innerHTML = '';
+  document.getElementById('cust-q').value = '';
+  toast('เลือกลูกค้าแล้ว');
+}
+function clearCustomer() {
+  selectedPatientId = null;
+  document.getElementById('cust-selected').classList.remove('show');
+  document.getElementById('cust-name').value = '';
+  document.getElementById('cust-phone').value = '';
+}
+
+document.getElementById('cust-q').addEventListener('keydown', function(e){
+  if (e.key === 'Enter') { e.preventDefault(); searchCustomer(); }
+});
+
+function refreshProducts() {
+  var q = document.getElementById('product').value.trim();
+  var box = document.getElementById('product-hits');
+  fetch('/api/warranty/products?q=' + encodeURIComponent(q))
+    .then(function(r){ return r.json(); })
+    .then(function(data){
+      var list = (data && data.products) || [];
+      box.innerHTML = '';
+      if (!list.length) { box.classList.remove('show'); return; }
+      list.forEach(function(name){
+        var d = document.createElement('div');
+        d.textContent = name;
+        d.onclick = function(){ pickProduct(name); };
+        box.appendChild(d);
+      });
+      box.classList.add('show');
+    })
+    .catch(function(){ box.classList.remove('show'); });
+}
+function pickProduct(name) {
+  document.getElementById('product').value = name;
+  document.getElementById('product-hits').classList.remove('show');
+  fetch('/api/warranty/product_defaults?name=' + encodeURIComponent(name))
+    .then(function(r){ return r.json(); })
+    .then(function(data){
+      var d = (data && data.defaults) || {};
+      if (d.seller != null) document.getElementById('seller').value = d.seller || '';
+      if (d.seller_phone) document.getElementById('seller-phone').value = formatPhoneLocal(d.seller_phone);
+      if (d.price != null && d.price !== '') {
+        var pf = parseFloat(d.price);
+        document.getElementById('price').value = (pf===Math.floor(pf)) ? String(Math.floor(pf)) : String(pf);
+      }
+      if (d.warranty_years != null && d.warranty_years !== '') {
+        var yf = parseFloat(d.warranty_years);
+        document.getElementById('years').value = (yf===Math.floor(yf)) ? String(Math.floor(yf)) : String(yf);
+      }
+      recomputeExpiry();
+      toast('เติมค่าจากครั้งล่าสุดแล้ว');
+    });
+}
+document.getElementById('product').addEventListener('input', function(){
+  clearTimeout(productTimer);
+  productTimer = setTimeout(refreshProducts, 180);
+});
+document.getElementById('product').addEventListener('focus', function(){
+  refreshProducts();
+});
+
+var pendingSaveBody = null;
+
+function collectSaveBody() {
+  var name = document.getElementById('cust-name').value.trim();
+  var phone = formatPhoneLocal(document.getElementById('cust-phone').value);
+  document.getElementById('cust-phone').value = phone;
+  var sellerPhone = formatPhoneLocal(document.getElementById('seller-phone').value);
+  document.getElementById('seller-phone').value = sellerPhone;
+  var product = document.getElementById('product').value.trim();
+  if (!product) { toast('ใส่ชื่อสินค้า'); return null; }
+  if (!selectedPatientId && !name && !phone) { toast('ค้นหาหรือกรอกชื่อ/เบอร์ลูกค้า'); return null; }
+  return {
+    patient_id: selectedPatientId,
+    name: name,
+    phone: phone,
+    product_name: product,
+    seller: document.getElementById('seller').value.trim(),
+    seller_phone: sellerPhone,
+    price: document.getElementById('price').value,
+    warranty_years: document.getElementById('years').value,
+    purchase_date: document.getElementById('purchase').value.trim(),
+    expiry_date: document.getElementById('expiry').value.trim(),
+    note: document.getElementById('note').value.trim()
+  };
+}
+
+function dash(v) {
+  v = String(v == null ? '' : v).trim();
+  return v ? v : '—';
+}
+
+function openConfirmSave() {
+  var body = collectSaveBody();
+  if (!body) return;
+  pendingSaveBody = body;
+  var custTag = selectedPatientId ? 'ลูกค้าเดิม (แก้ชื่อ/เบอร์ได้)' : 'ลูกค้าใหม่ (จะสร้างตอนยืนยัน)';
+  var priceShow = body.price !== '' && body.price != null ? body.price : '—';
+  var yearsShow = body.warranty_years !== '' && body.warranty_years != null
+    ? body.warranty_years + ' ปี' : '—';
+  var rows = [
+    ['ลูกค้า', dash(body.name)],
+    ['เบอร์โทร', dash(body.phone)],
+    ['สถานะ', custTag],
+    ['สินค้า', dash(body.product_name)],
+    ['ซื้อจาก', dash(body.seller)],
+    ['เบอร์ร้าน', dash(body.seller_phone)],
+    ['ราคา', priceShow],
+    ['ปีประกัน', yearsShow],
+    ['วันซื้อ', dash(body.purchase_date)],
+    ['วันหมดประกัน', dash(body.expiry_date)],
+    ['หมายเหตุ', dash(body.note)]
+  ];
+  var html = '';
+  rows.forEach(function(r){
+    html += '<tr><th>'+esc(r[0])+'</th><td>'+esc(r[1])+'</td></tr>';
+  });
+  document.getElementById('confirm-review').innerHTML = html;
+  document.getElementById('confirm-modal').classList.add('show');
+  document.getElementById('confirm-ok').focus();
+}
+
+function closeConfirmSave() {
+  document.getElementById('confirm-modal').classList.remove('show');
+  pendingSaveBody = null;
+  document.getElementById('save-btn').disabled = false;
+  document.getElementById('confirm-ok').disabled = false;
+  document.getElementById('confirm-ok').textContent = '✓ ยืนยันบันทึก';
+}
+
+document.getElementById('confirm-modal').addEventListener('click', function(e){
+  if (e.target === this) closeConfirmSave();
+});
+
+function confirmAndSave() {
+  if (!pendingSaveBody) { closeConfirmSave(); return; }
+  var body = pendingSaveBody;
+  var name = body.name;
+  var phone = body.phone;
+  var btn = document.getElementById('save-btn');
+  var okBtn = document.getElementById('confirm-ok');
+  btn.disabled = true;
+  okBtn.disabled = true;
+  okBtn.textContent = 'กำลังบันทึก...';
+  fetch('/api/warranty/save', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(body)
+  })
+  .then(function(r){ return r.json(); })
+  .then(function(data){
+    btn.disabled = false;
+    okBtn.disabled = false;
+    okBtn.textContent = '✓ ยืนยันบันทึก';
+    if (!data || !data.ok) {
+      toast((data && data.message) || 'บันทึกไม่สำเร็จ');
+      return;
+    }
+    closeConfirmSave();
+    toast('บันทึกแล้ว' + (data.patient && data.patient.hn_code ? ' · HN '+data.patient.hn_code : ''));
+    // เคลียร์แค่ส่วนอุปกรณ์ เก็บลูกค้าไว้ลงต่อได้
+    selectedPatientId = data.patient_id || selectedPatientId;
+    if (data.patient) {
+      selectCustomer({
+        id: data.patient.id || selectedPatientId,
+        name: data.patient.name || name,
+        phone: data.patient.phone || phone,
+        hn_code: data.patient.hn_code || ''
+      });
+    }
+    document.getElementById('product').value = '';
+    document.getElementById('seller').value = '';
+    document.getElementById('seller-phone').value = '';
+    document.getElementById('price').value = '';
+    document.getElementById('years').value = '';
+    document.getElementById('purchase').value = todayDMY();
+    document.getElementById('expiry').value = '';
+    document.getElementById('note').value = '';
+    document.getElementById('product-hits').classList.remove('show');
+  })
+  .catch(function(){
+    btn.disabled = false;
+    okBtn.disabled = false;
+    okBtn.textContent = '✓ ยืนยันบันทึก';
+    toast('เชื่อมต่อ server ไม่ได้');
+  });
+}
+
+function leftTag(n) {
+  if (n == null || n === '') return '<span class="tag">เหลือ —</span>';
+  n = parseInt(n, 10);
+  if (isNaN(n)) return '<span class="tag">เหลือ —</span>';
+  if (n < 0) return '<span class="tag bad">หมดแล้ว '+Math.abs(n)+' วัน</span>';
+  if (n <= 90) return '<span class="tag warn">เหลือ '+n+' วัน</span>';
+  return '<span class="tag ok">เหลือ '+n+' วัน</span>';
+}
+
+function openWarrantyHistory() {
+  var modal = document.getElementById('hist-modal');
+  var list = document.getElementById('hist-list');
+  var countEl = document.getElementById('hist-count');
+  modal.classList.add('show');
+  list.innerHTML = '<div class="hist-empty">กำลังโหลด...</div>';
+  countEl.textContent = '';
+  fetch('/api/warranty/list?limit=200')
+    .then(function(r){ return r.json(); })
+    .then(function(data){
+      if (!data || !data.ok) {
+        list.innerHTML = '<div class="hist-empty">'
+          + esc((data && data.message) || 'โหลดไม่สำเร็จ') + '</div>';
+        return;
+      }
+      var items = data.items || [];
+      countEl.textContent = items.length + ' รายการ';
+      if (!items.length) {
+        list.innerHTML = '<div class="hist-empty">ยังไม่มีรายการประกัน</div>';
+        return;
+      }
+      // server ส่ง id DESC แล้ว (ใหม่สุดบน) — เรนเดอร์ตามลำดับนั้น
+      var html = '';
+      items.forEach(function(w){
+        var priceS = (w.price != null && w.price !== '')
+          ? Number(w.price).toLocaleString('th-TH', {maximumFractionDigits:0}) + ' ฿'
+          : '—';
+        var phone = w.patient_phone || '';
+        var hn = w.hn_code ? 'HN '+w.hn_code : '';
+        html += '<div class="hist-card">'
+          + '<div class="prod">'+esc(w.product_name||'(ไม่มีชื่อสินค้า)')+'</div>'
+          + '<div class="cust">'+esc(w.patient_name||'(ไม่มีชื่อ)')+'</div>'
+          + '<div class="meta">'
+          + (phone ? esc(phone) : '')
+          + (phone && hn ? ' · ' : '')
+          + (hn ? esc(hn) : '')
+          + (!phone && !hn ? '—' : '')
+          + '</div>'
+          + '<div class="row-meta">'
+          + '<span class="tag">ซื้อ '+esc(w.purchase_date||'—')+'</span>'
+          + '<span class="tag">หมด '+esc(w.expiry_date||'—')+'</span>'
+          + leftTag(w.days_left)
+          + '<span class="tag">'+esc(priceS)+'</span>'
+          + '</div>'
+          + (w.seller || w.note
+            ? '<div class="meta" style="margin-top:8px">'
+              + (w.seller ? 'ซื้อจาก '+esc(w.seller) : '')
+              + (w.seller && w.note ? ' · ' : '')
+              + (w.note ? esc(w.note) : '')
+              + '</div>'
+            : '')
+          + '</div>';
+      });
+      list.innerHTML = html;
+    })
+    .catch(function(){
+      list.innerHTML = '<div class="hist-empty">เชื่อมต่อ server ไม่ได้</div>';
+    });
+}
+
+function closeWarrantyHistory() {
+  document.getElementById('hist-modal').classList.remove('show');
+}
+
+document.getElementById('hist-modal').addEventListener('click', function(e){
+  if (e.target === this) closeWarrantyHistory();
+});
+</script>
+</body>
+</html>

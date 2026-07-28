@@ -6,12 +6,15 @@ import sys
 
 subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "pyinstaller"], check=True)
 
+# warranty_page.html is loaded at runtime by local_server.py — must ship inside
+# the onefile bundle (Windows separator for --add-data is ';').
 subprocess.run([
     sys.executable, "-m", "PyInstaller",
     "--onefile",
     "--windowed",
     "--name", "LabelPrinter",
     "--noconfirm",
+    "--add-data", "warranty_page.html;.",
     "run.py",
 ], check=True)
 

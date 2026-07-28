@@ -16,8 +16,11 @@ of a small single-station shop.
 - **`local_server.py`** — stdlib-only `http.server` (no new pip dependency to bundle), started as
   a background thread from `LabelApp.__init__`. Binds the first free port in `PORT_RANGE`
   (8869-8879) on `0.0.0.0`, auto-detects the LAN IP via a UDP-connect trick (`get_lan_ip()`).
-  Serves the mobile page at `/` plus a small JSON API: `/api/search`, `/api/submit`,
-  `/api/favorites`, `/api/settings`, `/api/staff`, `/api/staff_add`, `/api/staff_delete`.
+  Serves the mobile page at `/` plus warranty page at `/warranty`, and JSON API:
+  `/api/search`, `/api/submit`, `/api/favorites`, `/api/settings`, `/api/staff`,
+  `/api/staff_add`, `/api/staff_delete`, plus warranty routes
+  (`/api/warranty/products`, `/api/warranty/product_defaults`, `/api/warranty/list`,
+  `/api/warranty/save`). Warranty data lives in SQLite table `warranties` (see `storage.py`).
 - **`storage.py`** — new tables: `print_queue` (the actual queue — claim-then-delete pattern, same
   principle as the shop POS version's mobile queue) and `staff_names` (who's allowed to appear in
   the phone-side staff picker).
@@ -75,6 +78,9 @@ per-conversation).
 `APP_VERSION` in `label_gui.py` (shown in the window title bar) — bump it whenever a commit ships
 a user-visible feature/fix batch, since there's no other version indicator in this app.
 
+- **1.19.0** — Warranty (ประกันอุปกรณ์) parity with HOPE: desktop list + add form,
+  mobile `/warranty`, CSV import, and clear import/test or clear-all before customer deploy.
+  Data in SQLite `warranties` table (`storage.py`); UI in `warranty_ui.py`.
 - **1.2.0** — "👤 เลือกชื่อลูกค้า" button in the list header: opens the existing "แฟ้มประวัติการจ่ายยา"
   dialog in a `pick_mode` (extra "✓ เลือกชื่อนี้" button, dialog stays open after picking so the
   pharmacist can close it manually) and carries the picked name+phone into the next print via

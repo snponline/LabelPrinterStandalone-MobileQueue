@@ -13,6 +13,7 @@ import json
 import os
 import re
 import socket
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -31,6 +32,27 @@ PORT_RANGE = range(8869, 8879)
 # version (see project-label-printer-hybrid memory) - there's no BeeStation-
 # style background sync in the picture at all.
 FAVORITES_PATH = os.path.join(storage.APP_DATA_DIR, "favorites.json")
+
+
+def _bundle_dir():
+    """Project dir when running from source; PyInstaller extract dir when frozen."""
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return sys._MEIPASS
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _load_warranty_page_html():
+    """Load mobile warranty page from warranty_page.html (bundled next to code)."""
+    path = os.path.join(_bundle_dir(), "warranty_page.html")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return (
+            "<!DOCTYPE html><html><body><h1>ไม่พบ warranty_page.html</h1>"
+            "<p>วางไฟล์ไว้ข้าง local_server.py (หรือ bundle ใน exe)</p>"
+            "<a href='/'>← กลับ</a></body></html>"
+        )
 
 
 def read_favorites():
@@ -171,6 +193,10 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/":
             self._send_html(QUEUE_PAGE_HTML)
 
+        elif parsed.path == "/warranty":
+            # หน้าเดียว: ค้นหา/สร้างลูกค้า + ลงทะเบียนประกันอุปกรณ์ (SQLite local)
+            self._send_html(_load_warranty_page_html())
+
         elif parsed.path == "/api/search":
             q = qs.get("q", [""])[0]
             if len(q.strip()) < 1:
@@ -221,6 +247,81 @@ class Handler(BaseHTTPRequestHandler):
             jobs = storage.list_print_jobs_for_patient(patient["name"], patient["phone"])
             docs = storage.list_patient_documents(patient_id)
             self._send_json({"ok": True, "patient": patient, "jobs": jobs, "documents": docs})
+
+        elif parsed.path == "/api/warranty/products":
+            q = qs.get("q", [""])[0].strip()
+            try:
+                names = storage.list_warranty_product_names(q, limit=40)
+            except Exception as e:
+                self._send_json({"ok": False, "message": str(e)}, 500)
+                return
+            self._send_json({"ok": True, "products": names})
+
+        elif parsed.path == "/api/warranty/product_defaults":
+            name = qs.get("name", [""])[0].strip()
+            if not name:
+                self._send_json({"ok": False, "message": "ใส่ชื่อสินค้า"}, 400)
+                return
+            try:
+                defaults = storage.get_latest_warranty_defaults(name) or {}
+            except Exception as e:
+                self._send_json({"ok": False, "message": str(e)}, 500)
+                return
+            if defaults.get("price") is not None:
+                try:
+                    defaults["price"] = float(defaults["price"])
+                except Exception:
+                    pass
+            if defaults.get("warranty_years") is not None:
+                try:
+                    defaults["warranty_years"] = float(defaults["warranty_years"])
+                except Exception:
+                    pass
+            self._send_json({"ok": True, "defaults": defaults})
+
+        elif parsed.path == "/api/warranty/list":
+            try:
+                limit = int(qs.get("limit", ["200"])[0] or 200)
+            except (TypeError, ValueError):
+                limit = 200
+            limit = max(1, min(limit, 500))
+            try:
+                rows = storage.list_warranties(limit=limit)
+            except Exception as e:
+                self._send_json({"ok": False, "message": str(e)}, 500)
+                return
+            out = []
+            for w in rows:
+                price = w.get("price")
+                try:
+                    price = float(price) if price is not None else None
+                except Exception:
+                    price = None
+                years = w.get("warranty_years")
+                try:
+                    years = float(years) if years is not None else None
+                except Exception:
+                    years = None
+                days_left = storage.warranty_days_left(w.get("expiry_date"))
+                out.append({
+                    "id": w.get("id"),
+                    "patient_id": w.get("patient_id"),
+                    "product_name": w.get("product_name") or "",
+                    "seller": w.get("seller") or "",
+                    "seller_phone": w.get("seller_phone") or "",
+                    "price": price,
+                    "purchase_date": storage._format_date_dmy(w.get("purchase_date")),
+                    "warranty_years": years,
+                    "expiry_date": storage._format_date_dmy(w.get("expiry_date")),
+                    "days_left": days_left,
+                    "note": w.get("note") or "",
+                    "patient_name": w.get("patient_name") or "",
+                    "patient_phone": w.get("patient_phone") or "",
+                    "hn_code": w.get("hn_code") or "",
+                    "source": w.get("source") or "",
+                    "created_at": storage._format_date_dmy(w.get("created_at")),
+                })
+            self._send_json({"ok": True, "items": out, "count": len(out)})
 
         elif parsed.path.startswith("/patient_docs/"):
             # /patient_docs/<patient_id>/<filename> - patient_id forced to int
@@ -325,6 +426,92 @@ class Handler(BaseHTTPRequestHandler):
             storage.delete_patient_document(doc_id)
             self._send_json({"ok": True})
 
+        elif self.path == "/api/warranty/save":
+            # หน้าเดียว: หา/สร้างลูกค้า + บันทึกประกัน (local SQLite)
+            body = self._read_json_body() or {}
+            name = (body.get("name") or "").strip()
+            phone = storage.format_phone_th(body.get("phone") or "")
+            product_name = (body.get("product_name") or "").strip()
+            if not product_name:
+                self._send_json({"ok": False, "message": "ใส่ชื่อสินค้า"}, 400)
+                return
+            patient_id = body.get("patient_id")
+            try:
+                patient_id = int(patient_id) if patient_id not in (None, "", 0, "0") else None
+            except (TypeError, ValueError):
+                patient_id = None
+            if patient_id and name:
+                p_chk = storage.get_patient(patient_id)
+                if p_chk and not storage._names_compatible(p_chk.get("name"), name):
+                    if storage._normalize_person_name(p_chk.get("name") or "") != storage._normalize_person_name(name):
+                        patient_id = None
+            if patient_id:
+                p = storage.get_patient(patient_id)
+                if not p:
+                    self._send_json({"ok": False, "message": "ไม่พบลูกค้าที่เลือก"}, 404)
+                    return
+                if name or phone:
+                    try:
+                        storage.update_patient_contact(
+                            patient_id,
+                            name or p.get("name") or "",
+                            phone or p.get("phone") or "",
+                        )
+                    except Exception:
+                        pass
+            else:
+                if not name and not phone:
+                    self._send_json({"ok": False, "message": "ใส่ชื่อหรือเบอร์ลูกค้า"}, 400)
+                    return
+                try:
+                    patient_id, _how = storage.find_or_create_patient_for_warranty(name or phone, phone)
+                except Exception as e:
+                    self._send_json({"ok": False, "message": f"สร้างลูกค้าไม่สำเร็จ: {e}"}, 400)
+                    return
+                if not patient_id:
+                    self._send_json({"ok": False, "message": "สร้างลูกค้าไม่สำเร็จ"}, 400)
+                    return
+
+            price = body.get("price")
+            try:
+                price = float(price) if price not in (None, "") else None
+            except (TypeError, ValueError):
+                price = None
+            years = body.get("warranty_years")
+            try:
+                years = float(years) if years not in (None, "") else None
+            except (TypeError, ValueError):
+                years = storage._parse_warranty_years(str(years or ""))
+            purchase_date = storage._parse_date_flexible(body.get("purchase_date") or "")
+            expiry_date = storage._parse_date_flexible(body.get("expiry_date") or "")
+            if expiry_date is None and purchase_date is not None and years is not None:
+                expiry_date = storage._add_years_to_date(purchase_date, years)
+            seller_phone = storage.format_phone_th(body.get("seller_phone") or "")
+            try:
+                wid = storage.add_warranty(
+                    patient_id=patient_id,
+                    product_name=product_name,
+                    seller=(body.get("seller") or "").strip() or None,
+                    seller_phone=seller_phone or None,
+                    price=price,
+                    purchase_date=purchase_date,
+                    warranty_years=years,
+                    expiry_date=expiry_date,
+                    note=(body.get("note") or "").strip() or None,
+                    source="mobile",
+                )
+            except Exception as e:
+                self._send_json({"ok": False, "message": f"บันทึกประกันไม่สำเร็จ: {e}"}, 400)
+                return
+            patient = storage.get_patient(patient_id) or {}
+            self._send_json({
+                "ok": True,
+                "warranty_id": wid,
+                "patient_id": patient_id,
+                "patient": patient,
+                "message": "บันทึกประกันแล้ว",
+            })
+
         else:
             self.send_response(404)
             self.end_headers()
@@ -362,9 +549,13 @@ QUEUE_PAGE_HTML = r"""<!DOCTYPE html>
   * { box-sizing:border-box; }
   body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; background:var(--bg); color:var(--text); -webkit-tap-highlight-color:transparent; }
   .header { background:var(--primary); color:#fff; position:sticky; top:0; z-index:20; }
-  .header-top { padding:14px 16px; display:flex; align-items:center; justify-content:space-between; }
-  .header h1 { font-size:18px; margin:0; font-weight:700; }
-  .header button { background:rgba(255,255,255,0.15); border:none; color:#fff; padding:8px 14px; border-radius:8px; font-size:13px; font-weight:600; cursor:pointer; }
+  .header-top { padding:14px 16px; display:flex; align-items:center; justify-content:space-between; gap:8px; }
+  .header h1 { font-size:18px; margin:0; font-weight:700; flex:1; }
+  .header button, .header a.hdr-btn {
+    background:rgba(255,255,255,0.15); border:none; color:#fff; padding:8px 12px; border-radius:8px;
+    font-size:13px; font-weight:600; cursor:pointer; text-decoration:none; white-space:nowrap;
+  }
+  .header a.hdr-btn:active { background:rgba(255,255,255,0.3); }
   .staff-bar { background:#1d4ed8; color:#fff; font-size:20px; font-weight:800; text-align:center; padding:8px 16px; }
 
   /* Staff picker screen */
@@ -496,6 +687,7 @@ QUEUE_PAGE_HTML = r"""<!DOCTYPE html>
   <div class="header">
     <div class="header-top">
       <h1>💊 คิวพิมพ์ฉลากยา</h1>
+      <a class="hdr-btn" href="/warranty">🛡 ประกัน</a>
       <button onclick="changeStaff()">เปลี่ยนชื่อ</button>
     </div>
     <div class="staff-bar" id="staff-bar"></div>
@@ -507,6 +699,9 @@ QUEUE_PAGE_HTML = r"""<!DOCTYPE html>
 
   <div class="section" style="padding-top:8px;">
     <button id="patient-open-btn" onclick="openPatientDialog()">🗂 ประวัติผู้ป่วย</button>
+  </div>
+  <div class="section" style="padding-top:8px;">
+    <a id="warranty-open-btn" href="/warranty" style="display:block;width:100%;padding:12px;font-size:15px;font-weight:700;color:#6a4a1a;background:#fff;border:1.5px solid #c4a574;border-radius:10px;cursor:pointer;text-align:center;text-decoration:none;box-sizing:border-box">🛡 ประกันอุปกรณ์</a>
   </div>
 
   <div class="section">

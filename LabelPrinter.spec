@@ -5,7 +5,7 @@ a = Analysis(
     ['run.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('warranty_page.html', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

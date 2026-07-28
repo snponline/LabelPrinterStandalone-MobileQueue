@@ -16,8 +16,12 @@ of a small single-station shop.
 - **`local_server.py`** — stdlib-only `http.server` (no new pip dependency to bundle), started as
   a background thread from `LabelApp.__init__`. Binds the first free port in `PORT_RANGE`
   (8869-8879) on `0.0.0.0`, auto-detects the LAN IP via a UDP-connect trick (`get_lan_ip()`).
-  Serves the mobile page at `/` plus a small JSON API: `/api/search`, `/api/submit`,
-  `/api/favorites`, `/api/settings`, `/api/staff`, `/api/staff_add`, `/api/staff_delete`.
+  Serves the mobile page at `/` plus warranty page at `/warranty`, and JSON API:
+  `/api/search`, `/api/submit`, `/api/favorites`, `/api/settings`, `/api/staff`,
+  `/api/staff_add`, `/api/staff_delete`, plus warranty routes
+  (`/api/warranty/products`, `/api/warranty/product_defaults`, `/api/warranty/list`,
+  `/api/warranty/save`). Warranty data lives in SQLite table `warranties` (see `storage.py`).
+  Desktop parity: `warranty_ui.py` (list, add form, Import CSV, clear import/test, clear all).
 - **`storage.py`** — new tables: `print_queue` (the actual queue — claim-then-delete pattern, same
   principle as the shop POS version's mobile queue) and `staff_names` (who's allowed to appear in
   the phone-side staff picker).
