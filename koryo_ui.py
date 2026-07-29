@@ -807,6 +807,161 @@ class KoryoMixin:
         parent.wait_window(win)
         return result["info"]
 
+    # -- shared by พิมพ์ฉลาก and บันทึกประวัติ --------------------------------
+
+    def controlled_precheck(self, parent, name):
+        """A controlled drug leaving the shelf has to reach ข.ย.11 whether or
+        not a sticker is printed, so both paths demand a real buyer name, ask
+        the quantity, and ask for the tramadol details up front.
+
+        Returns (controlled, tramadol_info, ok) where controlled is a list of
+        (drug, category, qty). ok=False means the caller must abort."""
+        controlled = []
+        for dd in self.selected_drugs:
+            try:
+                cat = storage.get_drug_report_category(dd.get("idproduct"))
+            except Exception:
+                cat = "none"
+            if cat in ("dangerous", "tramadol"):
+                controlled.append((dd, cat))
+        if not controlled:
+            return [], None, True
+        if not name or name == "ไม่ประสงค์ออกนาม":
+            names = ", ".join(sorted({dd.get("drug1", "") for dd, _ in controlled}))
+            messagebox.showwarning(
+                "ต้องกรอกชื่อผู้ซื้อ",
+                f"รายการนี้มียาที่ต้องรายงาน ข.ย.11 ({names})\n"
+                "กรุณากรอกชื่อ-นามสกุลผู้ซื้อก่อน "
+                "(ใช้ \"ไม่ประสงค์ออกนาม\" แทนไม่ได้)",
+                parent=parent,
+            )
+            return controlled, None, False
+        # This build has no dispense-quantity field on the drug row (HOPE gets
+        # it from its price tiers), and the label count is not the amount
+        # handed over, so ask rather than guess - a wrong number here is both
+        # a wrong ledger entry and a wrong stock figure.
+        with_qty = self._ask_controlled_quantities(parent, controlled)
+        if with_qty is None:
+            return controlled, None, False
+        tramadol_info = None
+        if any(cat == "tramadol" for _, cat, _ in with_qty):
+            try:
+                prior = storage.get_last_tramadol_buyer_info(
+                    getattr(self, "_queue_patient_id", None), name)
+            except Exception:
+                prior = None
+            tramadol_info = self._ask_tramadol_buyer_info(parent, name, prior)
+        return with_qty, tramadol_info, True
+
+    def _ask_controlled_quantities(self, parent, controlled):
+        """One row per controlled drug: how much was actually dispensed.
+        Returns [(drug, category, qty)] or None if cancelled."""
+        win = tk.Toplevel(parent)
+        win.title("จำนวนที่จ่าย (ข.ย.11)")
+        win.geometry(f"{fs(520)}x{fs(160 + 46 * len(controlled))}")
+        win.transient(parent)
+        win.grab_set()
+
+        tk.Label(win, text="ยาที่ต้องรายงาน ข.ย.11 - กรอกจำนวนที่จ่ายจริง",
+                 font=("Tahoma", fs(12), "bold")).pack(anchor="w", padx=fs(12), pady=(fs(10), fs(2)))
+        tk.Label(win, text="จำนวนนี้จะถูกบันทึกลงบัญชีและตัดออกจาก Lot",
+                 font=("Tahoma", fs(9)), fg="#555").pack(anchor="w", padx=fs(12))
+
+        vars_ = []
+        for dd, cat in controlled:
+            row = tk.Frame(win)
+            row.pack(fill="x", padx=fs(12), pady=fs(3))
+            tag = "tramadol" if cat == "tramadol" else "ยาอันตราย"
+            tk.Label(row, text=f"{dd.get('drug1', '')}  ({tag})", font=("Tahoma", fs(10)),
+                     anchor="w", wraplength=fs(300), justify="left").pack(side="left", fill="x", expand=True)
+            v = tk.StringVar(value="1")
+            tk.Entry(row, textvariable=v, font=("Tahoma", fs(11)), width=8).pack(side="left", padx=fs(6))
+            tk.Label(row, text=dd.get("unit", ""), font=("Tahoma", fs(10))).pack(side="left")
+            vars_.append((dd, cat, v))
+
+        status_var = tk.StringVar(value="")
+        tk.Label(win, textvariable=status_var, font=("Tahoma", fs(10)), fg="#b91c1c").pack(
+            anchor="w", padx=fs(12))
+
+        result = {"rows": None}
+
+        def on_ok():
+            out = []
+            for dd, cat, v in vars_:
+                try:
+                    q = float(v.get().strip())
+                except ValueError:
+                    status_var.set(f"จำนวนของ {dd.get('drug1', '')} ต้องเป็นตัวเลข")
+                    return
+                if q <= 0:
+                    status_var.set(f"จำนวนของ {dd.get('drug1', '')} ต้องมากกว่า 0")
+                    return
+                out.append((dd, cat, q))
+            result["rows"] = out
+            win.destroy()
+
+        btn_row = tk.Frame(win)
+        btn_row.pack(pady=fs(10))
+        tk.Button(btn_row, text="✓ ตกลง", font=("Tahoma", fs(12), "bold"), bg="#1a7a4a",
+                  fg="white", command=on_ok).pack(side="left", padx=fs(6))
+        tk.Button(btn_row, text="ยกเลิก", font=("Tahoma", fs(12)),
+                  command=win.destroy).pack(side="left", padx=fs(6))
+        win.lift()
+        win.focus_force()
+        parent.wait_window(win)
+        return result["rows"]
+
+    def record_controlled_sales(self, controlled, name, phone, patient_id,
+                                tramadol_info, print_job_id):
+        """Write the ข.ย.11 rows and draw the quantities out of their lots.
+        Best-effort per drug: whatever already happened must never be rolled
+        back over a ledger write. Returns the patient_id actually used, which
+        may have been created here."""
+        if not controlled:
+            return patient_id
+        if not patient_id:
+            try:
+                patient_id = self._ensure_patient_for_controlled_sale(name, phone)
+            except Exception:
+                patient_id = None
+        for dd, cat, qty in controlled:
+            try:
+                lot_id, lot_number = storage.fifo_decrement_lot(dd.get("idproduct"), qty)
+                carried = tramadol_info if cat == "tramadol" else None
+                storage.save_controlled_sale(
+                    dd.get("idproduct"), dd.get("drug1", ""), lot_id, lot_number, qty,
+                    dd.get("unit", ""), cat, name,
+                    buyer_citizen_id=(carried or {}).get("citizen_id", ""),
+                    buyer_address=(carried or {}).get("address", ""),
+                    print_job_id=print_job_id, patient_id=patient_id,
+                )
+            except Exception:
+                pass
+        return patient_id
+
+    def _ensure_patient_for_controlled_sale(self, name, phone):
+        """Link a controlled-drug buyer to a patients record so the next sale
+        can match on patient_id instead of the spelling of their name. Both
+        categories require a real buyer name, so both get linked.
+
+        Returns None rather than guessing when the name is ambiguous: two
+        people sharing a name are told apart only by phone, and picking one
+        would attach a citizen ID to possibly the wrong person."""
+        name = (name or "").strip()
+        if not name:
+            return None
+        if (phone or "").strip():
+            return storage.find_or_create_patient(name, phone)
+        try:
+            existing = storage.find_patients_by_exact_name(name)
+        except Exception:
+            return None
+        if len(existing) == 1:
+            return existing[0]["id"]
+        if not existing:
+            return storage.find_or_create_patient(name, "")
+        return None
+
     # -- ⚙ per-drug ข.ย. settings -------------------------------------------
 
     def open_drug_report_dialog(self, index):

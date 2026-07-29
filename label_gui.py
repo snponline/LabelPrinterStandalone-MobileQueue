@@ -4691,39 +4691,9 @@ class LabelApp(WarrantyMixin, KoryoMixin):
                         parent=win,
                     )
                     return
-            # ข.ย.11 - a controlled drug has to be reported whether or not a
-            # sticker comes out, so this is deliberately not filtered by any
-            # per-item print toggle. Categories are read once here, on the
-            # main thread, and reused by the worker below.
-            controlled = []
-            for dd in self.selected_drugs:
-                try:
-                    cat = storage.get_drug_report_category(dd.get("idproduct"))
-                except Exception:
-                    cat = "none"
-                if cat in ("dangerous", "tramadol"):
-                    controlled.append((dd, cat))
-            if controlled and not patient_var.get().strip():
-                names = ", ".join(sorted({dd.get("drug1", "") for dd, _ in controlled}))
-                messagebox.showwarning(
-                    "ต้องกรอกชื่อผู้ซื้อ",
-                    f"รายการนี้มียาที่ต้องรายงาน ข.ย.11 ({names})\n"
-                    "กรุณากรอกชื่อ-นามสกุลผู้ซื้อก่อนพิมพ์ "
-                    "(ใช้ \"ไม่ประสงค์ออกนาม\" แทนไม่ได้)",
-                    parent=win,
-                )
+            controlled, tramadol_info, ok = self.controlled_precheck(win, name)
+            if not ok:
                 return
-            # Ask before the print thread starts: the pharmacist confirms what
-            # goes in the ledger rather than it silently inheriting an earlier
-            # sale's details.
-            tramadol_info = None
-            if any(cat == "tramadol" for _, cat in controlled):
-                try:
-                    prior = storage.get_last_tramadol_buyer_info(self._queue_patient_id, name)
-                except Exception:
-                    prior = None
-                tramadol_info = self._ask_tramadol_buyer_info(win, name, prior)
-
             print_btn.config(state="disabled")
             dest = route.get("name") or "printer"
             status_var.set(f"กำลังพิมพ์ → {dest} ...")
@@ -4791,26 +4761,12 @@ class LabelApp(WarrantyMixin, KoryoMixin):
                         for img in label_imgs:
                             print_label_pages(img, copies=1, route=print_route)
                     job_id = storage.add_print_job(name, phone, self.selected_drugs, patient_id=patient_id)
-                    # ข.ย.11 - log each controlled dispense against its oldest
-                    # ข.ย.9 lot (FIFO). Best-effort: the labels already came
-                    # out and must never be rolled back over a ledger write.
-                    for dd, cat in controlled:
-                        try:
-                            qty = float(dd.get("sale_qty") or dd.get("print_qty") or 1)
-                        except (TypeError, ValueError):
-                            qty = 1.0
-                        try:
-                            lot_id, lot_number = storage.fifo_decrement_lot(dd.get("idproduct"), qty)
-                            carried = tramadol_info if cat == "tramadol" else None
-                            storage.save_controlled_sale(
-                                dd.get("idproduct"), dd.get("drug1", ""), lot_id, lot_number,
-                                qty, dd.get("unit", ""), cat, name,
-                                buyer_citizen_id=(carried or {}).get("citizen_id", ""),
-                                buyer_address=(carried or {}).get("address", ""),
-                                print_job_id=job_id, patient_id=patient_id,
-                            )
-                        except Exception:
-                            pass
+                    # ข.ย.11 - record the dispense and draw it out of its lot.
+                    # Shared with บันทึกประวัติ: the drug left the shelf either
+                    # way. May also create the patient link, hence the
+                    # reassignment.
+                    patient_id = self.record_controlled_sales(
+                        controlled, name, phone, patient_id, tramadol_info, job_id)
                     self.root.after(0, lambda: self.on_print_done(win, total_labels))
                 except Exception as e:
                     self.root.after(0, lambda: status_var.set(f"เกิดข้อผิดพลาด: {e}"))
@@ -4826,6 +4782,12 @@ class LabelApp(WarrantyMixin, KoryoMixin):
             # last time" lookup that didn't end in a real dispense.
             name = "ไม่ประสงค์ออกนาม" if anon_var.get() else patient_var.get().strip()
             phone = phone_var.get().strip()
+            # A controlled drug handed over without printing a sticker is
+            # still a dispense: same checks, same ledger row, same lot
+            # decrement as พิมพ์ฉลาก.
+            controlled, tramadol_info, ok = self.controlled_precheck(win, name)
+            if not ok:
+                return
             history_btn.config(state="disabled")
             print_btn.config(state="disabled")
             status_var.set("กำลังบันทึกประวัติ...")
@@ -4836,7 +4798,10 @@ class LabelApp(WarrantyMixin, KoryoMixin):
                         patient_id = storage.find_or_create_patient(name, phone)
                     else:
                         patient_id = self._queue_patient_id
-                    storage.add_print_job(name, phone, self.selected_drugs, patient_id=patient_id)
+                    job_id = storage.add_print_job(name, phone, self.selected_drugs,
+                                                   patient_id=patient_id)
+                    patient_id = self.record_controlled_sales(
+                        controlled, name, phone, patient_id, tramadol_info, job_id)
                     self.root.after(0, lambda: self.on_history_saved(win))
                 except Exception as e:
                     self.root.after(0, lambda: status_var.set(f"เกิดข้อผิดพลาด: {e}"))
