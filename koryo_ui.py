@@ -844,7 +844,7 @@ class KoryoMixin:
         if with_qty is None:
             return controlled, None, False
         tramadol_info = None
-        if any(cat == "tramadol" for _, cat, _ in with_qty):
+        if any(cat == "tramadol" for _, cat, _, _ in with_qty):
             try:
                 prior = storage.get_last_tramadol_buyer_info(
                     getattr(self, "_queue_patient_id", None), name)
@@ -853,9 +853,27 @@ class KoryoMixin:
             tramadol_info = self._ask_tramadol_buyer_info(parent, name, prior)
         return with_qty, tramadol_info, True
 
+    def _lot_unit_for(self, template_id, fallback=""):
+        """The unit a drug's stock is counted in - taken from its most recent
+        ข.ย.9 lot, because that is the unit the pharmacist actually typed when
+        recording it. Deliberately NOT the drug's `unit` field: that is the
+        dosing unit ("ทานครั้งละ 1 เม็ด"), and counting a sale in เม็ด against
+        a lot received in แผง would subtract one unit from another. HOPE
+        converts via its price tiers; this build has none, so it keeps
+        everything in the lot's own unit."""
+        try:
+            lots = storage.get_purchase_lots(template_id) if template_id else []
+        except Exception:
+            lots = []
+        for lt in reversed(lots):
+            if lt.get("unit_name"):
+                return lt["unit_name"]
+        return fallback
+
     def _ask_controlled_quantities(self, parent, controlled):
-        """One row per controlled drug: how much was actually dispensed.
-        Returns [(drug, category, qty)] or None if cancelled."""
+        """One row per controlled drug: how much was actually dispensed, in
+        that drug's stock unit. Returns [(drug, category, qty, unit)] or None
+        if cancelled."""
         win = tk.Toplevel(parent)
         win.title("จำนวนที่จ่าย (ข.ย.11)")
         win.geometry(f"{fs(520)}x{fs(160 + 46 * len(controlled))}")
@@ -873,11 +891,13 @@ class KoryoMixin:
             row.pack(fill="x", padx=fs(12), pady=fs(3))
             tag = "tramadol" if cat == "tramadol" else "ยาอันตราย"
             tk.Label(row, text=f"{dd.get('drug1', '')}  ({tag})", font=("Tahoma", fs(10)),
-                     anchor="w", wraplength=fs(300), justify="left").pack(side="left", fill="x", expand=True)
+                     anchor="w", wraplength=fs(280), justify="left").pack(side="left", fill="x", expand=True)
             v = tk.StringVar(value="1")
             tk.Entry(row, textvariable=v, font=("Tahoma", fs(11)), width=8).pack(side="left", padx=fs(6))
-            tk.Label(row, text=dd.get("unit", ""), font=("Tahoma", fs(10))).pack(side="left")
-            vars_.append((dd, cat, v))
+            unit = self._lot_unit_for(dd.get("idproduct"))
+            tk.Label(row, text=(unit or "(ยังไม่มีล็อต)"), font=("Tahoma", fs(10)),
+                     fg=("black" if unit else "#b45309")).pack(side="left")
+            vars_.append((dd, cat, v, unit))
 
         status_var = tk.StringVar(value="")
         tk.Label(win, textvariable=status_var, font=("Tahoma", fs(10)), fg="#b91c1c").pack(
@@ -887,7 +907,7 @@ class KoryoMixin:
 
         def on_ok():
             out = []
-            for dd, cat, v in vars_:
+            for dd, cat, v, unit in vars_:
                 try:
                     q = float(v.get().strip())
                 except ValueError:
@@ -896,7 +916,7 @@ class KoryoMixin:
                 if q <= 0:
                     status_var.set(f"จำนวนของ {dd.get('drug1', '')} ต้องมากกว่า 0")
                     return
-                out.append((dd, cat, q))
+                out.append((dd, cat, q, unit))
             result["rows"] = out
             win.destroy()
 
@@ -924,13 +944,13 @@ class KoryoMixin:
                 patient_id = self._ensure_patient_for_controlled_sale(name, phone)
             except Exception:
                 patient_id = None
-        for dd, cat, qty in controlled:
+        for dd, cat, qty, unit in controlled:
             try:
                 lot_id, lot_number = storage.fifo_decrement_lot(dd.get("idproduct"), qty)
                 carried = tramadol_info if cat == "tramadol" else None
                 storage.save_controlled_sale(
                     dd.get("idproduct"), dd.get("drug1", ""), lot_id, lot_number, qty,
-                    dd.get("unit", ""), cat, name,
+                    unit, cat, name,
                     buyer_citizen_id=(carried or {}).get("citizen_id", ""),
                     buyer_address=(carried or {}).get("address", ""),
                     print_job_id=print_job_id, patient_id=patient_id,
