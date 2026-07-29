@@ -34,7 +34,6 @@ import knowledge
 import machine_role
 import print_host_server
 from warranty_ui import WarrantyMixin
-import koryo_ui
 from koryo_ui import KoryoMixin
 
 # Runtime print-host bind address (set in main when role has print_host)
@@ -2183,6 +2182,25 @@ class LabelApp(WarrantyMixin, KoryoMixin):
             name_label.pack(side="left", fill="x", expand=True)
             name_label.bind("<Double-Button-1>", lambda e, idx=i: self.open_edit_dialog(idx))
 
+            # ⚙ = ยาควบคุม (ข.ย.) settings + lot entry, kept off the already
+            # crowded edit dialog. Coloured when this drug is reportable, so
+            # the list doubles as an at-a-glance "which of these are
+            # reportable" - same as HOPE label_printer.
+            gear_category = d.get("drug_report_category")
+            if gear_category is None and d.get("idproduct"):
+                try:
+                    gear_category = storage.get_drug_report_category(d["idproduct"])
+                except Exception:
+                    gear_category = "none"
+                d["drug_report_category"] = gear_category or "none"
+            gear_category = gear_category or "none"
+            tk.Button(
+                row, text="⚙", font=("Tahoma", fs(9)), width=2,
+                fg="white" if gear_category != "none" else "black",
+                bg="#7a4a1a" if gear_category != "none" else "#e0e0e0",
+                command=lambda idx=i: self.open_drug_report_dialog(idx),
+            ).pack(side="left", padx=(fs(2), 0))
+
             # exp_date/label_qty are remembered per-drug (drug_templates
             # columns) once the drug already has a saved template - a shop
             # dispenses from the same lot for a while, so auto-persisting on
@@ -2829,46 +2847,6 @@ class LabelApp(WarrantyMixin, KoryoMixin):
         tk.Label(name_row, text="บาร์โค้ด:", font=("Tahoma", fs(9))).pack(side="left", padx=(fs(6), fs(2)))
         barcode_var = tk.StringVar(value=d.get("barcode", ""))
         tk.Entry(name_row, textvariable=barcode_var, font=("Tahoma", fs(11)), width=14).pack(side="left")
-
-        # ข.ย. category + lot entry. Saved straight to drug_templates on
-        # change rather than waiting for the dialog's own save, because the
-        # lot dialog below needs a template id that already exists.
-        ky_row = tk.Frame(win)
-        ky_row.pack(fill="x", **pad)
-        tk.Label(ky_row, text="รายงาน ข.ย.", font=("Tahoma", fs(10), "bold")).pack(side="left")
-        _ky_labels = [lbl for _, lbl in koryo_ui.DRUG_REPORT_CATEGORIES]
-        _ky_by_label = {lbl: key for key, lbl in koryo_ui.DRUG_REPORT_CATEGORIES}
-        _cur_key = "none"
-        if d.get("idproduct"):
-            try:
-                _cur_key = storage.get_drug_report_category(d["idproduct"])
-            except Exception:
-                _cur_key = "none"
-        ky_cat_var = tk.StringVar(
-            value=dict(koryo_ui.DRUG_REPORT_CATEGORIES).get(_cur_key, _ky_labels[0]))
-        _ky_combo = ttk.Combobox(ky_row, textvariable=ky_cat_var, values=_ky_labels,
-                                 state="readonly", width=22, font=("Tahoma", fs(10)))
-        _ky_combo.pack(side="left", padx=fs(6))
-
-        def _on_ky_cat(_e=None):
-            if not d.get("idproduct"):
-                messagebox.showinfo("แจ้งเตือน", "บันทึกยานี้ลงฐานข้อมูลก่อน แล้วจึงตั้งหมวด ข.ย. ได้",
-                                    parent=win)
-                return
-            try:
-                storage.set_drug_report_category(d["idproduct"], _ky_by_label[ky_cat_var.get()])
-            except Exception as e:
-                messagebox.showerror("ผิดพลาด", f"บันทึกหมวดไม่สำเร็จ: {e}", parent=win)
-
-        _ky_combo.bind("<<ComboboxSelected>>", _on_ky_cat)
-        tk.Button(
-            ky_row, text="📦 บันทึกการซื้อ (ข.ย.9)", font=("Tahoma", fs(9)),
-            command=lambda: (
-                self.open_purchase_lot_dialog(win, d["idproduct"], d.get("drug1", ""))
-                if d.get("idproduct") else
-                messagebox.showinfo("แจ้งเตือน", "บันทึกยานี้ลงฐานข้อมูลก่อน", parent=win)
-            ),
-        ).pack(side="left", padx=(fs(6), 0))
 
         tk.Label(win, text="ประเภทการใช้ยา", font=("Tahoma", fs(10), "bold")).pack(anchor="w", **pad)
         mode_var = tk.StringVar(value=d.get("usage_mode", "oral"))

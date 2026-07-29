@@ -807,6 +807,82 @@ class KoryoMixin:
         parent.wait_window(win)
         return result["info"]
 
+    # -- ⚙ per-drug ข.ย. settings -------------------------------------------
+
+    def open_drug_report_dialog(self, index):
+        """⚙ popup - set this drug's ข.ย. reporting category and jump to lot
+        entry (ข.ย.9). Kept out of the drug edit dialog, which is crowded
+        enough that adding rows there would force a scrollbar."""
+        d = self.selected_drugs[index]
+        win = tk.Toplevel(self.root)
+        win.title(f"ยาควบคุม (ข.ย.) - {d.get('drug1', '')}")
+        win.geometry(f"{fs(480)}x{fs(270)}")
+        win.transient(self.root)
+        win.grab_set()
+
+        pad = {"padx": fs(12), "pady": fs(6)}
+        tk.Label(win, text=d.get("drug1", ""), font=("Tahoma", fs(11), "bold"),
+                 wraplength=fs(440), justify="left").pack(anchor="w", **pad)
+
+        labels = {key: lbl for key, lbl in DRUG_REPORT_CATEGORIES}
+        label_to_key = {lbl: key for key, lbl in DRUG_REPORT_CATEGORIES}
+        current = d.get("drug_report_category") or "none"
+        if d.get("idproduct"):
+            try:
+                current = storage.get_drug_report_category(d["idproduct"])
+            except Exception:
+                pass
+
+        tk.Label(win, text="การรายงานยาควบคุม (ข.ย.)",
+                 font=("Tahoma", fs(10), "bold")).pack(anchor="w", **pad)
+        display_var = tk.StringVar(value=labels.get(current, labels["none"]))
+        ttk.Combobox(win, textvariable=display_var, values=list(labels.values()),
+                     state="readonly", font=("Tahoma", fs(10))).pack(fill="x", padx=fs(12))
+
+        status_var = tk.StringVar(value="")
+        tk.Label(win, textvariable=status_var, font=("Tahoma", fs(9)), fg="#1a7a4a",
+                 wraplength=fs(440), justify="left").pack(anchor="w", padx=fs(12), pady=(fs(4), 0))
+
+        lot_btn = tk.Button(
+            win, text="📦 บันทึกล็อตใหม่ (ข.ย.9)", font=("Tahoma", fs(10), "bold"),
+            bg="#7a4a1a", fg="white",
+            command=lambda: self.open_purchase_lot_dialog(win, d.get("idproduct"), d.get("drug1", "")),
+        )
+        lot_btn.pack(**pad)
+
+        def sync(*_a):
+            key = label_to_key.get(display_var.get(), "none")
+            enabled = key != "none" and bool(d.get("idproduct"))
+            lot_btn.config(state="normal" if enabled else "disabled")
+            if key != "none" and not d.get("idproduct"):
+                status_var.set("บันทึกยานี้ลงฐานข้อมูลก่อน จึงจะบันทึกล็อตได้")
+            else:
+                status_var.set("")
+
+        display_var.trace_add("write", sync)
+        sync()
+
+        def on_save():
+            key = label_to_key.get(display_var.get(), "none")
+            d["drug_report_category"] = key
+            if d.get("idproduct"):
+                try:
+                    storage.set_drug_report_category(d["idproduct"], key)
+                except Exception as e:
+                    status_var.set(f"บันทึกไม่สำเร็จ: {e}")
+                    return
+            self.refresh_selected_list()
+            win.destroy()
+
+        btn_row = tk.Frame(win)
+        btn_row.pack(pady=fs(8))
+        tk.Button(btn_row, text="💾 บันทึก", font=("Tahoma", fs(11), "bold"), bg="#1a7a4a",
+                  fg="white", command=on_save).pack(side="left", padx=fs(4))
+        tk.Button(btn_row, text="ปิด", font=("Tahoma", fs(11)),
+                  command=win.destroy).pack(side="left", padx=fs(4))
+        win.lift()
+        win.focus_force()
+
     # -- ข.ย.9 lot entry -----------------------------------------------------
 
     def open_purchase_lot_dialog(self, parent_win, template_id, drug_name):
