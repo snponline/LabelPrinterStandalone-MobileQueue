@@ -31,7 +31,14 @@ import app_settings
 import local_server
 import ai_assist
 import knowledge
+import machine_role
+import print_host_server
 from warranty_ui import WarrantyMixin
+import koryo_ui
+from koryo_ui import KoryoMixin
+
+# Runtime print-host bind address (set in main when role has print_host)
+PRINT_HOST_ADDR = (None, None)  # (ip, port)
 
 FAVORITES_PATH = os.path.join(storage.APP_DATA_DIR, "favorites.json")
 DEBUG_PREVIEW_PATH = os.path.join(storage.APP_DATA_DIR, "_last_label_preview.png")
@@ -53,7 +60,7 @@ def save_favorites(favorites):
         json.dump(favorites, f, ensure_ascii=False, indent=2)
 
 
-APP_VERSION = "1.19.4"
+APP_VERSION = "1.21.0"
 
 DOTS_PER_MM = 8  # matches standard 203dpi thermal label printers
 
@@ -958,6 +965,138 @@ def print_image(img, printer_name=None):
     hdc.DeleteDC()
 
 
+def print_image_to_host(img, host_url, printer_name, copies=1):
+    """Send rendered label PNG to a LAN print host."""
+    import base64
+    import io
+    import urllib.request
+
+    host_url = (host_url or "").strip().rstrip("/")
+    if not host_url or not printer_name:
+        raise ValueError("ต้องมี host_url และ printer_name")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    payload = json.dumps({
+        "printer_name": printer_name,
+        "image_base64": base64.b64encode(buf.getvalue()).decode("ascii"),
+        "copies": int(copies) if copies else 1,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        f"{host_url}/print",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    if not data.get("ok"):
+        raise RuntimeError(data.get("message") or "print host ปฏิเสธงาน")
+    return data
+
+
+def resolve_desktop_print_route(settings=None):
+    """Where desktop Label App sends prints: local or a registered remote host."""
+    settings = settings or app_settings.load_settings()
+    target = (settings.get("desktop_print_target") or "local").strip() or "local"
+    local_printer = (settings.get("printer_name") or "").strip()
+    if target == "local":
+        return {
+            "mode": "local",
+            "name": "เครื่องนี้ (local)",
+            "printer_name": local_printer,
+            "host_url": "",
+        }
+    for h in (settings.get("remote_print_hosts") or []):
+        if not isinstance(h, dict):
+            continue
+        hid = (h.get("id") or "").strip()
+        if hid == target or (h.get("url") or "").strip().rstrip("/") == target:
+            url = (h.get("url") or "").strip().rstrip("/")
+            return {
+                "mode": "host",
+                "name": h.get("name") or url or hid,
+                "printer_name": (h.get("default_printer") or "").strip(),
+                "host_url": url,
+                "id": hid,
+            }
+    return {
+        "mode": "local",
+        "name": "เครื่องนี้ (local)",
+        "printer_name": local_printer,
+        "host_url": "",
+    }
+
+
+def print_label_pages(img, copies=1, route=None):
+    """Print one label image N times via local printer or remote print host."""
+    route = route or resolve_desktop_print_route()
+    copies = max(1, min(int(copies or 1), 20))
+    if route.get("mode") == "host" and route.get("host_url"):
+        prn = (route.get("printer_name") or "").strip()
+        if not prn:
+            raise RuntimeError(
+                f"Print host '{route.get('name')}' ยังไม่ได้ตั้งชื่อ printer บนเครื่องนั้น"
+            )
+        print_image_to_host(img, route["host_url"], prn, copies=copies)
+        return
+    prn = (route.get("printer_name") or "").strip()
+    if not prn:
+        raise RuntimeError("ยังไม่ได้ตั้งค่าเครื่องพิมพ์ local")
+    for _ in range(copies):
+        print_image(img, printer_name=prn)
+
+
+def print_drugs_now(drugs, patient_name="", has_allergy=False, printer_name=None, host_url=None):
+    """Render + print immediately (mobile print-now). Uses local SQLite templates.
+    Returns {ok, printed, message}."""
+    settings = app_settings.load_settings()
+    printer_name = (printer_name or settings.get("printer_name") or "").strip()
+    if not printer_name and not host_url:
+        return {"ok": False, "printed": 0, "message": "ยังไม่ได้ตั้งค่าเครื่องพิมพ์บนเครื่องนี้"}
+    if not drugs:
+        return {"ok": False, "printed": 0, "message": "ไม่มีรายการยา"}
+
+    name = (patient_name or "").strip() or "ไม่ประสงค์ออกนาม"
+    printed = 0
+    try:
+        for d in drugs:
+            data = dict(d)
+            idproduct = d.get("idproduct")
+            if idproduct:
+                try:
+                    info = storage.get_template(idproduct)
+                    if info:
+                        for k, v in info.items():
+                            if k not in data or data.get(k) in (None, ""):
+                                data[k] = v
+                        if not data.get("drug1"):
+                            data["drug1"] = info.get("drug1") or d.get("drug1") or d.get("name") or ""
+                except Exception:
+                    pass
+            if not data.get("drug1"):
+                data["drug1"] = d.get("name") or d.get("drug1") or "?"
+            data["patient_name"] = name
+            data["has_allergy"] = bool(has_allergy)
+            data.setdefault("print_qty", 1)
+            img = build_label_image(data, settings)
+            qty = int(data.get("print_qty") or 1)
+            qty = max(1, min(qty, 20))
+            if host_url:
+                print_image_to_host(img, host_url, printer_name, copies=qty)
+                printed += qty
+            else:
+                for _ in range(qty):
+                    print_image(img, printer_name=printer_name)
+                    printed += 1
+        try:
+            storage.add_print_job(name, "", drugs, patient_id=None)
+        except Exception:
+            pass
+        return {"ok": True, "printed": printed, "message": f"พิมพ์แล้ว {printed} แผ่น"}
+    except Exception as e:
+        return {"ok": False, "printed": printed, "message": str(e)}
+
+
 def build_settings_dialog(parent, first_run=False):
     """Settings screen: printer, label size, company/pharmacist info. Shown
     automatically on first run (no settings.json yet), reopenable any time
@@ -1009,6 +1148,214 @@ def build_settings_dialog(parent, first_run=False):
     printer_var = tk.StringVar(value=settings["printer_name"] or (printers[0] if printers else ""))
     printer_menu_values = printers or ["(ไม่พบเครื่องพิมพ์ที่ติดตั้งไว้)"]
     tk.OptionMenu(win, printer_var, *printer_menu_values).pack(fill="x", **pad)
+
+    role = machine_role.load_role() or machine_role.ROLE_DEFAULTS
+    tk.Label(win, text="Station / Print host", font=("Tahoma", fs(10), "bold")).pack(anchor="w", **pad)
+    station_name_var = tk.StringVar(value=settings.get("station_name") or role.get("station_name") or "")
+    tk.Entry(win, textvariable=station_name_var, font=("Tahoma", fs(10))).pack(fill="x", **pad)
+    tk.Label(win, text="ชื่อ station (เช่น หน้าร้าน) — ใช้ตอนมีหลายเครื่องภายหลัง", font=("Tahoma", fs(8)), fg="#666").pack(
+        anchor="w", padx=fs(10)
+    )
+    station_id_var = tk.StringVar(value=settings.get("station_id") or role.get("station_id") or "")
+    port_var = tk.StringVar(value=str(settings.get("print_host_port") or role.get("print_host_port") or 8970))
+    st_row = tk.Frame(win)
+    st_row.pack(fill="x", **pad)
+    tk.Label(st_row, text="รหัส", font=("Tahoma", fs(9))).pack(side="left")
+    tk.Entry(st_row, textvariable=station_id_var, font=("Tahoma", fs(10)), width=12).pack(side="left", padx=fs(4))
+    tk.Label(st_row, text="พอร์ต print host", font=("Tahoma", fs(9))).pack(side="left", padx=(fs(8), 0))
+    tk.Entry(st_row, textvariable=port_var, font=("Tahoma", fs(10)), width=6).pack(side="left", padx=fs(4))
+    ph_ip, ph_port = PRINT_HOST_ADDR
+    if ph_ip and ph_port:
+        ph_status = f"Print host เปิดอยู่: http://{ph_ip}:{ph_port}"
+        ph_fg = "#0a7a2f"
+    elif role.get("print_host"):
+        ph_status = "Print host ติ๊กไว้ — รีสตาร์ทโปรแกรมถ้ายังไม่ bind"
+        ph_fg = "#a60"
+    else:
+        ph_status = "Print host ปิด (เปิดที่ปุ่มบทบาทเครื่อง)"
+        ph_fg = "#666"
+    tk.Label(win, text=ph_status, font=("Tahoma", fs(8)), fg=ph_fg, wraplength=fs(400), justify="left").pack(
+        anchor="w", padx=fs(10)
+    )
+    tk.Button(
+        win, text="⚙ บทบาทเครื่อง (Label App / Print host)", font=("Tahoma", fs(9)),
+        command=lambda: open_role_dialog(dialog_win),
+    ).pack(anchor="w", padx=fs(10), pady=(fs(4), 0))
+
+    # ── remote print hosts ──
+    remotes = []
+    for h in (settings.get("remote_print_hosts") or []):
+        if isinstance(h, dict) and (h.get("url") or "").strip():
+            remotes.append({
+                "id": (h.get("id") or "").strip(),
+                "name": (h.get("name") or "").strip(),
+                "url": (h.get("url") or "").strip().rstrip("/"),
+                "default_printer": (h.get("default_printer") or "").strip(),
+            })
+
+    rem_fr = tk.LabelFrame(
+        win, text=" Print host เครื่องอื่น (desktop + มือถือเลือกได้) ",
+        font=("Tahoma", fs(9), "bold"), padx=fs(6), pady=fs(4),
+    )
+    rem_fr.pack(fill="x", **pad)
+    tk.Label(
+        rem_fr,
+        text="ลงทะเบียน PC อื่นที่รัน Print host — มือถือ/desktop จะเลือกพิมพ์ไปได้",
+        font=("Tahoma", fs(8)), fg="#555", wraplength=fs(400), justify="left",
+    ).pack(anchor="w")
+    rem_list = tk.Listbox(rem_fr, font=("Tahoma", fs(9)), height=3, exportselection=False)
+    rem_list.pack(fill="x", pady=fs(2))
+
+    def refresh_rem_list():
+        rem_list.delete(0, tk.END)
+        for h in remotes:
+            rem_list.insert(
+                tk.END,
+                f"{h.get('name') or '?'}  ·  {h.get('url','')}  ·  {h.get('default_printer') or '(default)'}",
+            )
+
+    refresh_rem_list()
+
+    r_name, r_url, r_printer = tk.StringVar(), tk.StringVar(), tk.StringVar()
+    add_grid = tk.Frame(rem_fr)
+    add_grid.pack(fill="x")
+    add_grid.columnconfigure(1, weight=1)
+    tk.Label(add_grid, text="ชื่อ", font=("Tahoma", fs(8))).grid(row=0, column=0, sticky="w")
+    tk.Entry(add_grid, textvariable=r_name, font=("Tahoma", fs(9))).grid(row=0, column=1, sticky="ew", pady=1)
+    tk.Label(add_grid, text="URL", font=("Tahoma", fs(8))).grid(row=1, column=0, sticky="w")
+    tk.Entry(add_grid, textvariable=r_url, font=("Tahoma", fs(9))).grid(row=1, column=1, sticky="ew", pady=1)
+    tk.Label(add_grid, text="Printer", font=("Tahoma", fs(8))).grid(row=2, column=0, sticky="w")
+    tk.Entry(add_grid, textvariable=r_printer, font=("Tahoma", fs(9))).grid(row=2, column=1, sticky="ew", pady=1)
+    tk.Label(
+        rem_fr, text="URL ตัวอย่าง: http://192.168.1.10:8970  ·  Printer = ชื่อบนเครื่องนั้น",
+        font=("Tahoma", fs(7)), fg="#888", wraplength=fs(400), justify="left",
+    ).pack(anchor="w")
+
+    rem_btns = tk.Frame(rem_fr)
+    rem_btns.pack(fill="x", pady=(fs(2), 0))
+
+    def _rebuild_desk_choices():
+        desk_choices.clear()
+        desk_choices.append(("local", "เครื่องนี้ (local printer)"))
+        for h in remotes:
+            hid = h.get("id") or h.get("url") or ""
+            label = h.get("name") or h.get("url") or hid
+            desk_choices.append((hid, f"→ {label} ({h.get('url') or ''})"))
+        desk_by_label.clear()
+        desk_by_label.update({c[1]: c[0] for c in desk_choices})
+        desk_combo["values"] = [c[1] for c in desk_choices]
+        if desk_var.get() not in desk_by_label:
+            desk_var.set(desk_choices[0][1])
+
+    def add_remote():
+        name = r_name.get().strip() or "station"
+        url = r_url.get().strip().rstrip("/")
+        prn = r_printer.get().strip()
+        if not url:
+            status_var.set("ใส่ URL ของ print host")
+            return
+        if not url.startswith("http://") and not url.startswith("https://"):
+            url = "http://" + url
+        host_id = re.sub(r"[^a-zA-Z0-9_-]+", "-", name).strip("-").lower() or "host"
+        base, n = host_id, 2
+        existing = {h.get("id") for h in remotes}
+        while host_id in existing:
+            host_id = f"{base}-{n}"
+            n += 1
+        remotes.append({"id": host_id, "name": name, "url": url.rstrip("/"), "default_printer": prn})
+        r_name.set("")
+        r_url.set("")
+        r_printer.set("")
+        refresh_rem_list()
+        _rebuild_desk_choices()
+        status_var.set("")
+
+    def del_remote():
+        sel = rem_list.curselection()
+        if not sel:
+            return
+        del remotes[sel[0]]
+        refresh_rem_list()
+        _rebuild_desk_choices()
+
+    def test_remote():
+        sel = rem_list.curselection()
+        if sel:
+            url = remotes[sel[0]].get("url")
+        else:
+            url = r_url.get().strip().rstrip("/")
+            if url and not url.startswith("http"):
+                url = "http://" + url
+        if not url:
+            status_var.set("เลือก host หรือใส่ URL ก่อนทดสอบ")
+            return
+        import urllib.request
+        try:
+            with urllib.request.urlopen(f"{url.rstrip('/')}/ping", timeout=4) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            if data.get("ok"):
+                messagebox.showinfo(
+                    "เชื่อมต่อได้",
+                    f"OK — {url}\nstation: {data.get('station_name') or '-'}\n"
+                    f"printer: {data.get('default_printer') or '-'}",
+                    parent=dialog_win,
+                )
+            else:
+                messagebox.showwarning("ตอบกลับแปลก", str(data), parent=dialog_win)
+        except Exception as e:
+            messagebox.showerror("เชื่อมต่อไม่ได้", f"{url}\n\n{e}", parent=dialog_win)
+
+    def fill_from_ping():
+        url = r_url.get().strip().rstrip("/")
+        if url and not url.startswith("http"):
+            url = "http://" + url
+        if not url:
+            status_var.set("ใส่ URL ก่อน")
+            return
+        import urllib.request
+        try:
+            with urllib.request.urlopen(f"{url.rstrip('/')}/ping", timeout=4) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            if data.get("station_name") and not r_name.get().strip():
+                r_name.set(data.get("station_name") or "")
+            if data.get("default_printer"):
+                r_printer.set(data.get("default_printer") or "")
+            messagebox.showinfo("ดึงค่าแล้ว", "เติมชื่อ/printer จาก /ping แล้ว", parent=dialog_win)
+        except Exception as e:
+            messagebox.showerror("ดึงค่าไม่ได้", str(e), parent=dialog_win)
+
+    tk.Button(rem_btns, text="＋ เพิ่ม", font=("Tahoma", fs(8)), bg="#1a5a9a", fg="white", command=add_remote).pack(
+        side="left", padx=(0, fs(3))
+    )
+    tk.Button(rem_btns, text="🗑 ลบ", font=("Tahoma", fs(8)), command=del_remote).pack(side="left", padx=(0, fs(3)))
+    tk.Button(rem_btns, text="🔌 ทดสอบ", font=("Tahoma", fs(8)), command=test_remote).pack(side="left", padx=(0, fs(3)))
+    tk.Button(rem_btns, text="⬇ /ping", font=("Tahoma", fs(8)), command=fill_from_ping).pack(side="left")
+
+    # Desktop print destination
+    desk_fr = tk.LabelFrame(
+        win, text=" พิมพ์จากโปรแกรม desktop ไปที่ ",
+        font=("Tahoma", fs(9), "bold"), padx=fs(6), pady=fs(4),
+    )
+    desk_fr.pack(fill="x", **pad)
+    tk.Label(
+        desk_fr,
+        text="เครื่องที่ไม่มี printer เสียบอยู่ เลือก print host เครื่องอื่นได้ที่นี่",
+        font=("Tahoma", fs(8)), fg="#555", wraplength=fs(400), justify="left",
+    ).pack(anchor="w")
+    desk_choices = [("local", "เครื่องนี้ (local printer)")]
+    for h in remotes:
+        hid = h.get("id") or h.get("url") or ""
+        label = h.get("name") or h.get("url") or hid
+        desk_choices.append((hid, f"→ {label} ({h.get('url') or ''})"))
+    desk_by_label = {c[1]: c[0] for c in desk_choices}
+    label_by_id = {c[0]: c[1] for c in desk_choices}
+    cur_target = (settings.get("desktop_print_target") or "local").strip() or "local"
+    desk_var = tk.StringVar(value=label_by_id.get(cur_target, desk_choices[0][1]))
+    desk_combo = ttk.Combobox(
+        desk_fr, textvariable=desk_var, values=[c[1] for c in desk_choices],
+        state="readonly", font=("Tahoma", fs(9)),
+    )
+    desk_combo.pack(fill="x", pady=fs(2))
 
     size_frame = tk.Frame(win)
     size_frame.pack(fill="x", **pad)
@@ -1071,26 +1418,53 @@ def build_settings_dialog(parent, first_run=False):
              wraplength=fs(400), justify="left").pack(padx=fs(10))
 
     def on_save():
-        if not printer_var.get().strip():
-            status_var.set("กรุณาเลือกเครื่องพิมพ์")
+        desk_target = desk_by_label.get(desk_var.get(), "local")
+        prn = printer_var.get().strip()
+        if not prn and desk_target == "local":
+            status_var.set("กรุณาเลือกเครื่องพิมพ์ local (หรือตั้งพิมพ์ไป host อื่น)")
             return
+        if desk_target != "local":
+            rem = next((h for h in remotes if (h.get("id") or h.get("url")) == desk_target), None)
+            if not rem or not (rem.get("url") or "").strip():
+                status_var.set("เลือก print host ที่ลงทะเบียนแล้ว (กด ＋ เพิ่ม ก่อน)")
+                return
+            if not (rem.get("default_printer") or "").strip():
+                status_var.set("host นั้นยังไม่มีชื่อ Printer — ใส่แล้ว ＋ เพิ่ม")
+                return
         try:
             w = int(w_var.get().strip())
             h = int(h_var.get().strip())
         except ValueError:
             status_var.set("ขนาดฉลากต้องเป็นตัวเลข")
             return
-        app_settings.save_settings({
-            "printer_name": printer_var.get().strip(),
+        try:
+            ph_port_i = int(port_var.get().strip() or 8970)
+        except ValueError:
+            status_var.set("พอร์ต print host ต้องเป็นตัวเลข")
+            return
+        merged = dict(settings)
+        merged.update({
+            "printer_name": prn or settings.get("printer_name") or "",
             "label_w_mm": w, "label_h_mm": h,
             "paper_mode": PAPER_MODE_KEYS_BY_LABEL.get(paper_mode_var.get(), "thermal"),
             "company_name": name_var.get().strip(),
             "address_line1": addr1_var.get().strip(),
             "address_line2": addr2_var.get().strip(),
+            "station_name": station_name_var.get().strip(),
+            "station_id": station_id_var.get().strip(),
+            "print_host_port": ph_port_i,
+            "remote_print_hosts": list(remotes),
+            "desktop_print_target": desk_target,
             "phone": phone_var.get().strip(),
             "pharmacist_names": pharm_var.get().strip(),
             **{ai_assist.PROVIDERS[k]["key_field"]: v.get().strip() for k, v in ai_key_vars.items()},
         })
+        app_settings.save_settings(merged)
+        r = machine_role.load_role() or dict(machine_role.ROLE_DEFAULTS)
+        r["print_host_port"] = ph_port_i
+        r["station_name"] = station_name_var.get().strip()
+        r["station_id"] = station_id_var.get().strip()
+        machine_role.save_role(r)
         dialog_win.destroy()
 
     tk.Button(
@@ -1214,7 +1588,7 @@ def build_settings_dialog(parent, first_run=False):
     return dialog_win
 
 
-class LabelApp(WarrantyMixin):
+class LabelApp(WarrantyMixin, KoryoMixin):
     def __init__(self, root):
         self.root = root
         root.title(f"พิมพ์ฉลากยา v{APP_VERSION}")
@@ -1278,6 +1652,10 @@ class LabelApp(WarrantyMixin):
         tk.Button(
             toolbar, text="🛡 ประกัน", font=_tb["font"],
             bg="#6a4a1a", fg="white", command=self.open_warranty_dialog,
+        ).pack(side="left", padx=(0, fs(4)))
+        tk.Button(
+            toolbar, text="📋 ข.ย.9/11", font=_tb["font"],
+            bg="#7a4a1a", fg="white", command=self.open_koryo_report_dialog,
         ).pack(side="left", padx=(0, fs(4)))
         tk.Button(
             toolbar, text="📱 คิวมือถือ", font=_tb["font"],
@@ -2452,6 +2830,46 @@ class LabelApp(WarrantyMixin):
         barcode_var = tk.StringVar(value=d.get("barcode", ""))
         tk.Entry(name_row, textvariable=barcode_var, font=("Tahoma", fs(11)), width=14).pack(side="left")
 
+        # ข.ย. category + lot entry. Saved straight to drug_templates on
+        # change rather than waiting for the dialog's own save, because the
+        # lot dialog below needs a template id that already exists.
+        ky_row = tk.Frame(win)
+        ky_row.pack(fill="x", **pad)
+        tk.Label(ky_row, text="รายงาน ข.ย.", font=("Tahoma", fs(10), "bold")).pack(side="left")
+        _ky_labels = [lbl for _, lbl in koryo_ui.DRUG_REPORT_CATEGORIES]
+        _ky_by_label = {lbl: key for key, lbl in koryo_ui.DRUG_REPORT_CATEGORIES}
+        _cur_key = "none"
+        if d.get("idproduct"):
+            try:
+                _cur_key = storage.get_drug_report_category(d["idproduct"])
+            except Exception:
+                _cur_key = "none"
+        ky_cat_var = tk.StringVar(
+            value=dict(koryo_ui.DRUG_REPORT_CATEGORIES).get(_cur_key, _ky_labels[0]))
+        _ky_combo = ttk.Combobox(ky_row, textvariable=ky_cat_var, values=_ky_labels,
+                                 state="readonly", width=22, font=("Tahoma", fs(10)))
+        _ky_combo.pack(side="left", padx=fs(6))
+
+        def _on_ky_cat(_e=None):
+            if not d.get("idproduct"):
+                messagebox.showinfo("แจ้งเตือน", "บันทึกยานี้ลงฐานข้อมูลก่อน แล้วจึงตั้งหมวด ข.ย. ได้",
+                                    parent=win)
+                return
+            try:
+                storage.set_drug_report_category(d["idproduct"], _ky_by_label[ky_cat_var.get()])
+            except Exception as e:
+                messagebox.showerror("ผิดพลาด", f"บันทึกหมวดไม่สำเร็จ: {e}", parent=win)
+
+        _ky_combo.bind("<<ComboboxSelected>>", _on_ky_cat)
+        tk.Button(
+            ky_row, text="📦 บันทึกการซื้อ (ข.ย.9)", font=("Tahoma", fs(9)),
+            command=lambda: (
+                self.open_purchase_lot_dialog(win, d["idproduct"], d.get("drug1", ""))
+                if d.get("idproduct") else
+                messagebox.showinfo("แจ้งเตือน", "บันทึกยานี้ลงฐานข้อมูลก่อน", parent=win)
+            ),
+        ).pack(side="left", padx=(fs(6), 0))
+
         tk.Label(win, text="ประเภทการใช้ยา", font=("Tahoma", fs(10), "bold")).pack(anchor="w", **pad)
         mode_var = tk.StringVar(value=d.get("usage_mode", "oral"))
         mode_label_to_key = {v: k for k, v in USAGE_MODE_LABELS.items()}
@@ -2818,6 +3236,28 @@ class LabelApp(WarrantyMixin):
             tk.Button(
                 war_row, text="📋", font=("Tahoma", fs(9)),
                 command=_copy_war,
+            ).pack(side="left", padx=(fs(4), 0))
+
+        ph_ip, ph_port = PRINT_HOST_ADDR
+        if ph_ip and ph_port:
+            ph_url = f"http://{ph_ip}:{ph_port}"
+            tk.Label(win, text="Print host (รับพิมพ์ LAN):", font=("Tahoma", fs(8)), fg="#0a7a2f").pack(
+                anchor="w", padx=fs(10), pady=(fs(4), 0)
+            )
+            ph_row = tk.Frame(win)
+            ph_row.pack(fill="x", padx=fs(10), pady=(0, fs(2)))
+            ph_var = tk.StringVar(value=ph_url)
+            tk.Entry(
+                ph_row, textvariable=ph_var, font=("Tahoma", fs(10), "bold"), fg="#0a7a2f",
+                state="readonly", readonlybackground="white", relief="solid", bd=1,
+            ).pack(side="left", fill="x", expand=True, ipady=fs(2))
+            tk.Button(
+                ph_row, text="📋", font=("Tahoma", fs(9)),
+                command=lambda: (
+                    self.root.clipboard_clear(),
+                    self.root.clipboard_append(ph_url),
+                    copied_var.set(f"คัดลอก {ph_url} แล้ว"),
+                ),
             ).pack(side="left", padx=(fs(4), 0))
 
         copied_var = tk.StringVar(value="")
@@ -4263,12 +4703,57 @@ class LabelApp(WarrantyMixin):
             # around by ticking "anonymous" every single time
             name = "ไม่ประสงค์ออกนาม" if anon_var.get() else patient_var.get().strip()
             phone = phone_var.get().strip()
+            route = resolve_desktop_print_route()
+            if route.get("mode") == "host":
+                if not route.get("host_url") or not route.get("printer_name"):
+                    messagebox.showwarning(
+                        "แจ้งเตือน",
+                        "ตั้งพิมพ์ไป Print host แล้ว แต่ยังไม่ครบ (URL / ชื่อ printer)\n"
+                        "ไปที่ ⚙️ ตั้งค่า → ลงทะเบียน host และเลือก «พิมพ์จาก desktop ไปที่»",
+                        parent=win,
+                    )
+                    return
+            # ข.ย.11 - a controlled drug has to be reported whether or not a
+            # sticker comes out, so this is deliberately not filtered by any
+            # per-item print toggle. Categories are read once here, on the
+            # main thread, and reused by the worker below.
+            controlled = []
+            for dd in self.selected_drugs:
+                try:
+                    cat = storage.get_drug_report_category(dd.get("idproduct"))
+                except Exception:
+                    cat = "none"
+                if cat in ("dangerous", "tramadol"):
+                    controlled.append((dd, cat))
+            if controlled and not patient_var.get().strip():
+                names = ", ".join(sorted({dd.get("drug1", "") for dd, _ in controlled}))
+                messagebox.showwarning(
+                    "ต้องกรอกชื่อผู้ซื้อ",
+                    f"รายการนี้มียาที่ต้องรายงาน ข.ย.11 ({names})\n"
+                    "กรุณากรอกชื่อ-นามสกุลผู้ซื้อก่อนพิมพ์ "
+                    "(ใช้ \"ไม่ประสงค์ออกนาม\" แทนไม่ได้)",
+                    parent=win,
+                )
+                return
+            # Ask before the print thread starts: the pharmacist confirms what
+            # goes in the ledger rather than it silently inheriting an earlier
+            # sale's details.
+            tramadol_info = None
+            if any(cat == "tramadol" for _, cat in controlled):
+                try:
+                    prior = storage.get_last_tramadol_buyer_info(self._queue_patient_id, name)
+                except Exception:
+                    prior = None
+                tramadol_info = self._ask_tramadol_buyer_info(win, name, prior)
+
             print_btn.config(state="disabled")
-            status_var.set("กำลังพิมพ์...")
+            dest = route.get("name") or "printer"
+            status_var.set(f"กำลังพิมพ์ → {dest} ...")
 
             def worker():
                 try:
                     settings = app_settings.load_settings()
+                    print_route = resolve_desktop_print_route(settings)
                     # patient_id only ever comes from a real patients-table
                     # record - either just created/found here (save ticked),
                     # or already resolved unambiguously by pick_name(). A
@@ -4317,13 +4802,37 @@ class LabelApp(WarrantyMixin):
                         label_imgs.extend([img] * d.get("print_qty", 1))
                     if label_imgs:
                         label_imgs[-1].save(DEBUG_PREVIEW_PATH)
-                    if settings.get("paper_mode") == "a4":
+                    # Remote host: always send one-label pages (A4 tiling is local-only)
+                    if print_route.get("mode") == "host" and print_route.get("host_url"):
+                        for img in label_imgs:
+                            print_label_pages(img, copies=1, route=print_route)
+                    elif settings.get("paper_mode") == "a4":
                         for page in build_a4_pages(label_imgs):
                             print_image(page)
                     else:
                         for img in label_imgs:
-                            print_image(img)
-                    storage.add_print_job(name, phone, self.selected_drugs, patient_id=patient_id)
+                            print_label_pages(img, copies=1, route=print_route)
+                    job_id = storage.add_print_job(name, phone, self.selected_drugs, patient_id=patient_id)
+                    # ข.ย.11 - log each controlled dispense against its oldest
+                    # ข.ย.9 lot (FIFO). Best-effort: the labels already came
+                    # out and must never be rolled back over a ledger write.
+                    for dd, cat in controlled:
+                        try:
+                            qty = float(dd.get("sale_qty") or dd.get("print_qty") or 1)
+                        except (TypeError, ValueError):
+                            qty = 1.0
+                        try:
+                            lot_id, lot_number = storage.fifo_decrement_lot(dd.get("idproduct"), qty)
+                            carried = tramadol_info if cat == "tramadol" else None
+                            storage.save_controlled_sale(
+                                dd.get("idproduct"), dd.get("drug1", ""), lot_id, lot_number,
+                                qty, dd.get("unit", ""), cat, name,
+                                buyer_citizen_id=(carried or {}).get("citizen_id", ""),
+                                buyer_address=(carried or {}).get("address", ""),
+                                print_job_id=job_id, patient_id=patient_id,
+                            )
+                        except Exception:
+                            pass
                     self.root.after(0, lambda: self.on_print_done(win, total_labels))
                 except Exception as e:
                     self.root.after(0, lambda: status_var.set(f"เกิดข้อผิดพลาด: {e}"))
@@ -4397,7 +4906,109 @@ class LabelApp(WarrantyMixin):
         self.refresh_selected_list()
 
 
+def open_role_dialog(parent=None):
+    """Change label_app / print_host roles (saved to role.json)."""
+    role = machine_role.load_role() or dict(machine_role.ROLE_DEFAULTS)
+    win = tk.Toplevel(parent) if parent else tk.Tk()
+    if parent:
+        win.transient(parent)
+        win.grab_set()
+    win.title("บทบาทเครื่องนี้")
+    win.geometry(f"{fs(420)}x{fs(280)}")
+
+    tk.Label(win, text="เครื่องนี้ทำหน้าที่อะไรบ้าง?", font=("Tahoma", fs(11), "bold")).pack(
+        anchor="w", padx=fs(12), pady=(fs(12), fs(8))
+    )
+    label_var = tk.BooleanVar(value=bool(role.get("label_app", True)))
+    print_var = tk.BooleanVar(value=bool(role.get("print_host", True)))
+    tk.Checkbutton(
+        win, text="โปรแกรมฉลากยา (Label App) — GUI เต็ม + คิวมือถือ",
+        variable=label_var, font=("Tahoma", fs(10)), anchor="w",
+    ).pack(fill="x", padx=fs(16))
+    tk.Checkbutton(
+        win, text="Print host — รับพิมพ์จากมือถือบน WiFi ร้าน",
+        variable=print_var, font=("Tahoma", fs(10)), anchor="w",
+    ).pack(fill="x", padx=fs(16), pady=(fs(4), 0))
+    tk.Label(
+        win, text="บันทึกแล้วควรรีสตาร์ทโปรแกรมเพื่อให้ Print host เริ่ม/หยุด",
+        font=("Tahoma", fs(8)), fg="#666", wraplength=fs(380), justify="left",
+    ).pack(anchor="w", padx=fs(12), pady=fs(10))
+
+    def on_save():
+        if not label_var.get() and not print_var.get():
+            messagebox.showwarning("แจ้งเตือน", "ต้องติ๊กอย่างน้อย 1 บทบาท", parent=win)
+            return
+        r = machine_role.load_role() or dict(machine_role.ROLE_DEFAULTS)
+        r["label_app"] = bool(label_var.get())
+        r["print_host"] = bool(print_var.get())
+        machine_role.save_role(r)
+        messagebox.showinfo(
+            "บันทึกแล้ว",
+            "บันทึกบทบาทแล้ว\nกรุณาปิดแล้วเปิดโปรแกรมใหม่เพื่อให้มีผลกับ Print host",
+            parent=win,
+        )
+        win.destroy()
+
+    tk.Button(win, text="💾 บันทึก", font=("Tahoma", fs(10), "bold"), bg="#1a7a4a", fg="white", command=on_save).pack(
+        pady=fs(10)
+    )
+    if not parent:
+        win.mainloop()
+
+
+def _start_print_host_from_settings():
+    global PRINT_HOST_ADDR
+    role = machine_role.load_role() or {}
+    settings = app_settings.load_settings()
+    port = settings.get("print_host_port") or role.get("print_host_port") or 8970
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        port = 8970
+    ip, bound = print_host_server.start_server(
+        port=port,
+        station_id=settings.get("station_id") or role.get("station_id") or "",
+        station_name=settings.get("station_name") or role.get("station_name") or "",
+        default_printer=settings.get("printer_name") or "",
+    )
+    PRINT_HOST_ADDR = (ip, bound)
+    return ip, bound
+
+
 def main():
+    global PRINT_HOST_ADDR
+
+    role = machine_role.load_role()
+    if role is None:
+        role = machine_role.ask_role_gui()
+        machine_role.save_role(role)
+    wants_label = bool(role.get("label_app", True))
+    wants_print_host = bool(role.get("print_host", False))
+
+    if wants_print_host:
+        _start_print_host_from_settings()
+
+    if not wants_label and wants_print_host:
+        settings = app_settings.load_settings()
+        ip, port = PRINT_HOST_ADDR
+        machine_role.run_print_only_window(
+            ip, port,
+            station_name=settings.get("station_name") or "",
+            printer_name=settings.get("printer_name") or "",
+        )
+        return
+
+    if not wants_label and not wants_print_host:
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showinfo(
+            "ไม่มีบทบาท",
+            f"ไม่ได้ติ๊ก Label App หรือ Print host\n"
+            f"ลบไฟล์นี้แล้วเปิดใหม่:\n{machine_role.ROLE_PATH}",
+        )
+        root.destroy()
+        return
+
     root = tk.Tk()
     # NOTE: do NOT withdraw() root before showing the first-run settings
     # Toplevel. On Windows, a Toplevel with transient(parent) set can fail to
