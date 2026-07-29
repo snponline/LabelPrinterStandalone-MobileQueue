@@ -217,6 +217,56 @@ def _connect():
         conn.execute("ALTER TABLE patient_documents_new RENAME TO patient_documents")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_patient_documents_patient ON patient_documents(patient_id)")
         conn.commit()
+
+    # ── ข.ย.9 / ข.ย.11 ledgers ───────────────────────────────────────────
+    # Same two ledgers as HOPE label_printer's Label_Purchase_Lots /
+    # Label_Controlled_Sales, in local SQLite so this standalone build needs
+    # no shop POS. The one structural difference: HOPE keys everything to the
+    # POS catalog's idproduct, which doesn't exist here, so lots and sales
+    # point at drug_templates.id instead.
+    if "drug_report_category" not in existing_cols:
+        # "none" | "dangerous" (ยาอันตรายที่ อย. กำหนด) | "tramadol"
+        conn.execute("ALTER TABLE drug_templates ADD COLUMN drug_report_category TEXT")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS purchase_lots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            template_id INTEGER,
+            drug_name TEXT NOT NULL,
+            received_date TEXT NOT NULL,
+            source_company TEXT,
+            lot_number TEXT,
+            exp_date TEXT,
+            unit_name TEXT,
+            qty_received REAL NOT NULL,
+            qty_remaining REAL NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_purchase_lots_template ON purchase_lots(template_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_purchase_lots_received ON purchase_lots(received_date)")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS controlled_sales (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            template_id INTEGER,
+            drug_name TEXT NOT NULL,
+            lot_id INTEGER,
+            lot_number TEXT,
+            unit_name TEXT,
+            qty REAL NOT NULL,
+            category TEXT NOT NULL,
+            buyer_name TEXT,
+            buyer_citizen_id TEXT,
+            buyer_address TEXT,
+            info_complete INTEGER NOT NULL DEFAULT 0,
+            sold_at TEXT NOT NULL,
+            print_job_id INTEGER,
+            patient_id INTEGER
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_controlled_sales_template ON controlled_sales(template_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_controlled_sales_category ON controlled_sales(category)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_controlled_sales_complete ON controlled_sales(info_complete)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_controlled_sales_patient ON controlled_sales(patient_id)")
     return conn
 
 
@@ -1895,3 +1945,425 @@ def clear_imported_and_test_warranties(also_orphan_patients=True):
 
 
 
+
+
+# ── ข.ย.9 / ข.ย.11 ───────────────────────────────────────────────────────────
+# Ported from HOPE label_printer. Behaviour is deliberately identical; the only
+# structural difference is that a drug is identified by drug_templates.id
+# (template_id) rather than a POS catalog idproduct, because this build has no
+# POS to key against.
+
+
+def set_drug_report_category(template_id, category):
+    """'none' | 'dangerous' | 'tramadol' - which ledger, if any, a dispense of
+    this drug has to be reported in."""
+    if category not in ("none", "dangerous", "tramadol"):
+        raise ValueError("category ไม่ถูกต้อง")
+    conn = _connect()
+    try:
+        conn.execute(
+            "UPDATE drug_templates SET drug_report_category = ? WHERE id = ?",
+            (category, int(template_id)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_drug_report_category(template_id):
+    if not template_id:
+        return "none"
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT drug_report_category FROM drug_templates WHERE id = ?", (int(template_id),)
+        ).fetchone()
+    finally:
+        conn.close()
+    return row[0] if row and row[0] else "none"
+
+
+# ── ข.ย.9: purchase lots ─────────────────────────────────────────────────────
+
+
+def save_purchase_lot(template_id, drug_name, received_date, source_company, lot_number,
+                      qty, unit_name, exp_date=""):
+    """Record a lot received. qty_remaining starts at qty_received and is drawn
+    down by fifo_decrement_lot() as the drug is dispensed."""
+    qty = float(qty)
+    if qty <= 0:
+        raise ValueError("จำนวนที่รับต้องมากกว่า 0")
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            "INSERT INTO purchase_lots (template_id, drug_name, received_date, source_company, "
+            " lot_number, exp_date, unit_name, qty_received, qty_remaining, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (int(template_id) if template_id else None, drug_name, received_date,
+             source_company or "", lot_number or "", exp_date or "", unit_name or "",
+             qty, qty, datetime.now().isoformat()),
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def get_purchase_lots(template_id):
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT id, drug_name, received_date, source_company, lot_number, exp_date, "
+            "       unit_name, qty_received, qty_remaining "
+            "FROM purchase_lots WHERE template_id = ? ORDER BY received_date ASC, id ASC",
+            (int(template_id),),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [{
+        "id": r[0], "drug_name": r[1], "received_date": r[2], "source_company": r[3] or "",
+        "lot_number": r[4] or "", "exp_date": r[5] or "", "unit_name": r[6] or "",
+        "qty_received": float(r[7] or 0), "qty_remaining": float(r[8] or 0),
+    } for r in rows]
+
+
+def delete_purchase_lot(lot_id):
+    conn = _connect()
+    try:
+        conn.execute("DELETE FROM purchase_lots WHERE id = ?", (int(lot_id),))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def fifo_decrement_lot(template_id, qty):
+    """Draw qty from the oldest lot of this drug that still has stock, clamped
+    at 0. Returns (lot_id, lot_number), or (None, None) when no lot is on file -
+    a print is never blocked over ledger bookkeeping."""
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT id, lot_number, qty_remaining FROM purchase_lots "
+            "WHERE template_id = ? AND qty_remaining > 0 ORDER BY received_date ASC, id ASC LIMIT 1",
+            (int(template_id),),
+        ).fetchone()
+        if not row:
+            return None, None
+        lot_id, lot_number, remaining = row[0], row[1], float(row[2] or 0)
+        conn.execute(
+            "UPDATE purchase_lots SET qty_remaining = ? WHERE id = ?",
+            (max(0.0, remaining - float(qty)), lot_id),
+        )
+        conn.commit()
+        return lot_id, lot_number
+    finally:
+        conn.close()
+
+
+def get_lot_remaining(lot_id):
+    if not lot_id:
+        return None
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT qty_remaining, qty_received, unit_name FROM purchase_lots WHERE id = ?",
+            (int(lot_id),),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return None
+    return {"remaining": float(row[0] or 0), "received": float(row[1] or 0), "unit": row[2] or ""}
+
+
+def build_ky9_rows(date_from=None, date_to=None):
+    """One row per lot received in range, ordered drug then date so
+    build_ky9_sheets() can group straight off it."""
+    where, params = [], []
+    if date_from:
+        where.append("date(received_date) >= date(?)")
+        params.append(date_from)
+    if date_to:
+        where.append("date(received_date) <= date(?)")
+        params.append(date_to)
+    where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT received_date, source_company, drug_name, lot_number, qty_received, "
+            "       unit_name, exp_date, template_id "
+            "FROM purchase_lots" + where_sql + " ORDER BY drug_name, received_date ASC, id ASC",
+            params,
+        ).fetchall()
+    finally:
+        conn.close()
+    return [{
+        "seq": i + 1, "date": str(r[0])[:10], "seller": r[1] or "", "drug_name": r[2],
+        "lot_number": r[3] or "", "qty": r[4], "unit_name": r[5] or "",
+        "exp_date": r[6] or "", "template_id": r[7],
+    } for i, r in enumerate(rows)]
+
+
+def build_ky9_sheets(date_from=None, date_to=None):
+    """One sheet per drug - ข.ย.9 is filed per drug, so a single flat table
+    covering every drug isn't a usable ledger page. Sequence restarts at 1 in
+    each sheet. Grouped by template_id, falling back to the name."""
+    sheets, order = {}, []
+    for r in build_ky9_rows(date_from, date_to):
+        key = r.get("template_id") or "name:" + r["drug_name"]
+        if key not in sheets:
+            sheets[key] = {"product_name": r["drug_name"], "unit_name": r["unit_name"] or "",
+                           "sources": [], "rows": []}
+            order.append(key)
+        sh = sheets[key]
+        row = dict(r)
+        row["seq"] = len(sh["rows"]) + 1
+        sh["rows"].append(row)
+        if r["seller"] and r["seller"] not in sh["sources"]:
+            sh["sources"].append(r["seller"])
+    return [sheets[k] for k in order]
+
+
+# ── ข.ย.11: controlled sales ─────────────────────────────────────────────────
+
+
+def save_controlled_sale(template_id, drug_name, lot_id, lot_number, qty, unit_name, category,
+                         buyer_name, buyer_citizen_id="", buyer_address="",
+                         print_job_id=None, patient_id=None):
+    """One ข.ย.11 sale row. For tramadol the citizen ID/address are blank unless
+    the caller pre-filled them, leaving info_complete=0 to be finished later
+    from the report screen."""
+    complete = 1 if (category != "tramadol" or (buyer_citizen_id and buyer_address)) else 0
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            "INSERT INTO controlled_sales (template_id, drug_name, lot_id, lot_number, unit_name, "
+            " qty, category, buyer_name, buyer_citizen_id, buyer_address, info_complete, sold_at, "
+            " print_job_id, patient_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (int(template_id) if template_id else None, drug_name, lot_id, lot_number or "",
+             unit_name or "", float(qty), category, buyer_name or "", buyer_citizen_id or "",
+             buyer_address or "", complete, datetime.now().isoformat(), print_job_id,
+             int(patient_id) if patient_id else None),
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def fill_controlled_sale_info(sale_id, citizen_id, address):
+    """Deferred tramadol entry - fill in citizen ID + address after the fact."""
+    complete = 1 if (citizen_id and address) else 0
+    conn = _connect()
+    try:
+        conn.execute(
+            "UPDATE controlled_sales SET buyer_citizen_id = ?, buyer_address = ?, info_complete = ? "
+            "WHERE id = ?",
+            (citizen_id or "", address or "", complete, int(sale_id)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def update_controlled_sale_basics(sale_id, date_iso, buyer_name):
+    """Correct the sale date and buyer name. The date keeps its original
+    time-of-day so same-day ordering within a sheet stays stable."""
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT sold_at FROM controlled_sales WHERE id = ?", (int(sale_id),)
+        ).fetchone()
+        if not row:
+            raise ValueError("ไม่พบรายการขายนี้")
+        old = str(row[0] or "")
+        time_part = old[10:] if len(old) > 10 else ""
+        conn.execute(
+            "UPDATE controlled_sales SET sold_at = ?, buyer_name = ? WHERE id = ?",
+            (str(date_iso) + time_part, buyer_name or "", int(sale_id)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _clamp_lot(conn, lot_id, delta):
+    """Move a lot's qty_remaining by a signed delta, kept inside
+    0..qty_received - a correction must never drive a lot negative or above
+    what was received."""
+    row = conn.execute(
+        "SELECT qty_remaining, qty_received FROM purchase_lots WHERE id = ?", (int(lot_id),)
+    ).fetchone()
+    if not row:
+        return
+    remaining, received = float(row[0] or 0), float(row[1] or 0)
+    conn.execute(
+        "UPDATE purchase_lots SET qty_remaining = ? WHERE id = ?",
+        (min(received, max(0.0, remaining + delta)), int(lot_id)),
+    )
+
+
+def adjust_controlled_sale_qty(sale_id, new_qty):
+    """Correct a recorded quantity, moving the difference back into (or out of)
+    the lot it came from - staff mis-key quantities, and fixing the ledger
+    without fixing the stock just trades one wrong number for another."""
+    new_qty = float(new_qty)
+    if new_qty <= 0:
+        raise ValueError("จำนวนต้องมากกว่า 0")
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT qty, lot_id FROM controlled_sales WHERE id = ?", (int(sale_id),)
+        ).fetchone()
+        if not row:
+            raise ValueError("ไม่พบรายการขายนี้")
+        old_qty, lot_id = float(row[0] or 0), row[1]
+        conn.execute("UPDATE controlled_sales SET qty = ? WHERE id = ?", (new_qty, int(sale_id)))
+        if lot_id:
+            _clamp_lot(conn, lot_id, old_qty - new_qty)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def delete_controlled_sale(sale_id):
+    """Remove one row and put its quantity back into its lot."""
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT qty, lot_id FROM controlled_sales WHERE id = ?", (int(sale_id),)
+        ).fetchone()
+        if not row:
+            return
+        qty, lot_id = float(row[0] or 0), row[1]
+        if lot_id and qty:
+            _clamp_lot(conn, lot_id, qty)
+        conn.execute("DELETE FROM controlled_sales WHERE id = ?", (int(sale_id),))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def clear_controlled_sales(category=None):
+    """Wipe ข.ย.11 sale rows - one category, or all - returning every quantity
+    to its lot. purchase_lots rows (the ข.ย.9 purchase ledger) are never
+    deleted. Returns how many sale rows were removed."""
+    conn = _connect()
+    try:
+        if category:
+            rows = conn.execute(
+                "SELECT lot_id, SUM(qty) FROM controlled_sales "
+                "WHERE lot_id IS NOT NULL AND category = ? GROUP BY lot_id", (category,)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT lot_id, SUM(qty) FROM controlled_sales "
+                "WHERE lot_id IS NOT NULL GROUP BY lot_id"
+            ).fetchall()
+        for lot_id, total in rows:
+            _clamp_lot(conn, lot_id, float(total or 0))
+        if category:
+            cur = conn.execute("DELETE FROM controlled_sales WHERE category = ?", (category,))
+        else:
+            cur = conn.execute("DELETE FROM controlled_sales")
+        removed = cur.rowcount
+        conn.commit()
+        return removed
+    finally:
+        conn.close()
+
+
+def get_last_tramadol_buyer_info(patient_id, buyer_name=None):
+    """Citizen ID + address from this buyer's most recent completed tramadol
+    sale. Tries patient_id first, then an exact buyer_name - a sale can
+    legitimately have no patient link, and without the fallback that history is
+    invisible even though it's on file. "matched_by" tells the dialog which
+    basis was used so it can ask for a closer look on the weaker one."""
+    def q(where, param):
+        conn = _connect()
+        try:
+            return conn.execute(
+                "SELECT buyer_citizen_id, buyer_address FROM controlled_sales "
+                "WHERE " + where + " AND category = 'tramadol' AND info_complete = 1 "
+                "  AND IFNULL(buyer_citizen_id, '') != '' AND IFNULL(buyer_address, '') != '' "
+                "ORDER BY sold_at DESC, id DESC LIMIT 1",
+                (param,),
+            ).fetchone()
+        finally:
+            conn.close()
+
+    row, matched_by = None, None
+    if patient_id:
+        row, matched_by = q("patient_id = ?", int(patient_id)), "patient"
+    if not row and (buyer_name or "").strip():
+        row, matched_by = q("buyer_name = ?", buyer_name.strip()), "name"
+    if not row:
+        return None
+    return {"citizen_id": row[0] or "", "address": row[1] or "", "matched_by": matched_by}
+
+
+def build_ky11_sheets(category, date_from=None, date_to=None):
+    """One sheet per drug, each with its lot summary and its sales, mirroring
+    HOPE's build_ky11_sheets(). Sales carry lot_remaining so the report screen
+    can show what's left in the lot a sale came out of."""
+    where, params = ["category = ?"], [category]
+    if date_from:
+        where.append("date(sold_at) >= date(?)")
+        params.append(date_from)
+    if date_to:
+        where.append("date(sold_at) <= date(?)")
+        params.append(date_to)
+    conn = _connect()
+    try:
+        sale_rows = conn.execute(
+            "SELECT id, template_id, drug_name, lot_number, unit_name, qty, buyer_name, "
+            "       buyer_citizen_id, buyer_address, info_complete, sold_at, lot_id "
+            "FROM controlled_sales WHERE " + " AND ".join(where) +
+            " ORDER BY drug_name, sold_at ASC, id ASC",
+            params,
+        ).fetchall()
+        template_ids = sorted({r[1] for r in sale_rows if r[1] is not None})
+        lots_by_template, remaining_by_lot = {}, {}
+        if template_ids:
+            marks = ",".join("?" for _ in template_ids)
+            for r in conn.execute(
+                "SELECT template_id, lot_number, received_date, qty_received, source_company, "
+                "       id, qty_remaining FROM purchase_lots WHERE template_id IN (" + marks + ") "
+                "ORDER BY received_date ASC, id ASC", template_ids,
+            ).fetchall():
+                lots_by_template.setdefault(r[0], []).append({
+                    "lot_number": r[1] or "", "received_date": str(r[2])[:10],
+                    "qty_received": float(r[3] or 0), "source": r[4] or "",
+                })
+                remaining_by_lot[r[5]] = float(r[6] or 0)
+    finally:
+        conn.close()
+
+    sheets, order = {}, []
+    for (sale_id, template_id, drug_name, lot_number, unit_name, qty, buyer_name,
+         citizen_id, address, info_complete, sold_at, lot_id) in sale_rows:
+        key = template_id if template_id is not None else "name:" + drug_name
+        if key not in sheets:
+            lots = lots_by_template.get(template_id, [])
+            sheets[key] = {
+                "product_id": template_id, "product_name": drug_name, "unit_name": unit_name or "",
+                "lots": lots,
+                "sources": sorted({lt["source"] for lt in lots if lt["source"]}),
+                "sales": [],
+            }
+            order.append(key)
+        buyer_block = buyer_name or ""
+        if category == "tramadol":
+            buyer_block = "\n".join([
+                buyer_name or "-",
+                citizen_id or "(ยังไม่กรอกเลขบัตร)",
+                address or "(ยังไม่กรอกที่อยู่)",
+            ])
+        sheets[key]["sales"].append({
+            "id": sale_id, "seq": len(sheets[key]["sales"]) + 1, "date": str(sold_at)[:10],
+            "qty": qty, "lot_number": lot_number or "-", "buyer_name": buyer_name or "",
+            "buyer_block": buyer_block, "citizen_id": citizen_id or "", "address": address or "",
+            "info_complete": bool(info_complete), "lot_id": lot_id,
+            "lot_remaining": remaining_by_lot.get(lot_id) if lot_id else None,
+        })
+    return [sheets[k] for k in order]
