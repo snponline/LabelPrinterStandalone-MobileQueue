@@ -227,6 +227,52 @@ class Handler(BaseHTTPRequestHandler):
                 "pharmacist_names": settings.get("pharmacist_names") or "",
             })
 
+        elif parsed.path == "/api/print_info":
+            settings = app_settings.load_settings()
+            try:
+                import label_gui as lg
+                ph_ip, ph_port = getattr(lg, "PRINT_HOST_ADDR", (None, None))
+            except Exception:
+                ph_ip, ph_port = None, None
+            local_printer = settings.get("printer_name") or ""
+            local_name = (settings.get("station_name") or "").strip() or "เครื่องนี้"
+            hosts = []
+            if local_printer:
+                hosts.append({
+                    "id": "local-direct",
+                    "name": f"{local_name} (พิมพ์ตรง)",
+                    "url": "",
+                    "default_printer": local_printer,
+                    "is_local": True,
+                    "mode": "direct",
+                })
+            if ph_ip and ph_port:
+                hosts.append({
+                    "id": settings.get("station_id") or "local-host",
+                    "name": f"{local_name} (Print host :{ph_port})",
+                    "url": f"http://{ph_ip}:{ph_port}",
+                    "default_printer": local_printer,
+                    "is_local": True,
+                    "mode": "host",
+                })
+            for h in (settings.get("remote_print_hosts") or []):
+                if isinstance(h, dict) and (h.get("url") or "").strip():
+                    hosts.append({
+                        "id": h.get("id") or h.get("url"),
+                        "name": h.get("name") or h.get("url"),
+                        "url": (h.get("url") or "").strip().rstrip("/"),
+                        "default_printer": h.get("default_printer") or "",
+                        "is_local": False,
+                        "mode": "host",
+                    })
+            self._send_json({
+                "ok": True,
+                "printer_name": local_printer,
+                "station_name": settings.get("station_name") or "",
+                "print_hosts": hosts,
+                "can_print_local": bool(local_printer),
+            })
+
         elif parsed.path == "/api/staff":
             self._send_json(storage.list_staff_names())
 
@@ -361,6 +407,27 @@ class Handler(BaseHTTPRequestHandler):
                 has_allergy=bool(body.get("has_allergy")),
             )
             self._send_json({"ok": True, "id": job_id})
+
+        elif self.path == "/api/print_now":
+            # Print immediately on this PC (or host_url → remote print host)
+            body = self._read_json_body() or {}
+            drugs = body.get("drugs") or []
+            if not drugs:
+                self._send_json({"ok": False, "message": "กรุณาเลือกยาอย่างน้อย 1 รายการ"}, 400)
+                return
+            try:
+                import label_gui as lg
+                result = lg.print_drugs_now(
+                    drugs,
+                    patient_name=body.get("patient_name") or "",
+                    has_allergy=bool(body.get("has_allergy")),
+                    printer_name=(body.get("printer_name") or "").strip() or None,
+                    host_url=(body.get("host_url") or "").strip() or None,
+                )
+            except Exception as e:
+                self._send_json({"ok": False, "message": f"พิมพ์ไม่สำเร็จ: {e}"}, 500)
+                return
+            self._send_json(result, 200 if result.get("ok") else 400)
 
         elif self.path == "/api/staff_add":
             body = self._read_json_body()
@@ -581,7 +648,7 @@ QUEUE_PAGE_HTML = r"""<!DOCTYPE html>
   .confirm-no { background:#e5e7eb; color:var(--text); }
 
   /* App screen */
-  #app-screen { display:none; padding-bottom:100px; }
+  #app-screen { display:none; padding-bottom:140px; }
   #app-screen.show { display:block; }
 
   .section { padding:14px 16px; }
@@ -661,9 +728,15 @@ QUEUE_PAGE_HTML = r"""<!DOCTYPE html>
   .lp-bottom { font-size:11px; color:#333; text-align:right; }
   .lp-blank { display:inline-block; border-bottom:1px solid #000; width:70px; }
 
-  #submit-bar { position:fixed; bottom:0; left:0; right:0; background:#fff; border-top:1px solid var(--border); padding:12px 16px; z-index:20; box-shadow:0 -4px 12px rgba(0,0,0,0.06); }
-  #submit-btn { width:100%; padding:16px; font-size:18px; font-weight:700; color:#fff; background:var(--primary); border:none; border-radius:12px; cursor:pointer; }
-  #submit-btn:disabled { opacity:.5; }
+  #submit-bar { position:fixed; bottom:0; left:0; right:0; background:#fff; border-top:1px solid var(--border); padding:10px 12px 12px; z-index:20; box-shadow:0 -4px 12px rgba(0,0,0,0.06); }
+  #print-station-row { display:flex; align-items:center; gap:8px; margin-bottom:8px; }
+  #print-station-row label { font-size:12px; font-weight:700; color:var(--muted); white-space:nowrap; }
+  #print-station { flex:1; padding:10px; font-size:14px; border:1.5px solid var(--border); border-radius:10px; background:#fff; }
+  #submit-actions { display:flex; gap:8px; }
+  #submit-btn, #print-now-btn { flex:1; padding:14px 10px; font-size:15px; font-weight:700; color:#fff; border:none; border-radius:12px; cursor:pointer; }
+  #submit-btn { background:var(--primary); }
+  #print-now-btn { background:#6a4a1a; }
+  #submit-btn:disabled, #print-now-btn:disabled { opacity:.5; }
   #toast { position:fixed; left:50%; bottom:90px; transform:translateX(-50%) translateY(20px); background:#1a1a2e; color:#fff; padding:12px 20px; border-radius:10px; font-size:14px; z-index:100; opacity:0; pointer-events:none; transition:all .25s ease; max-width:90vw; text-align:center; }
   #toast.show { opacity:1; transform:translateX(-50%) translateY(0); }
 </style>
@@ -720,7 +793,14 @@ QUEUE_PAGE_HTML = r"""<!DOCTYPE html>
   </div>
 
   <div id="submit-bar">
-    <button id="submit-btn" onclick="submitQueue()">📤 ส่งเข้าคิวพิมพ์</button>
+    <div id="print-station-row">
+      <label for="print-station">พิมพ์ที่</label>
+      <select id="print-station"></select>
+    </div>
+    <div id="submit-actions">
+      <button id="submit-btn" onclick="submitQueue()">📤 ส่งเข้าคิว</button>
+      <button id="print-now-btn" onclick="printNow()">🖨 พิมพ์เลย</button>
+    </div>
   </div>
 </div>
 
@@ -1225,14 +1305,11 @@ function clearAllSelected() {
   });
 }
 
-// ── Submit ────────────────────────────────────────────────────
-function submitQueue() {
-  if (!selected.length) { showToast('กรุณาเลือกยาอย่างน้อย 1 รายการ'); return; }
-  var btn = document.getElementById('submit-btn');
-  btn.disabled = true;
-  var body = {
+// ── Submit / Print now ────────────────────────────────────────
+function buildJobBody() {
+  return {
     patient_name: currentStaff,
-    has_allergy: document.getElementById('allergy-checkbox').checked,
+    has_allergy: !!(document.getElementById('allergy-checkbox') && document.getElementById('allergy-checkbox').checked),
     drugs: selected.map(function(d) {
       return {
         idproduct: d.idproduct, drug1: d.drug1, drug2: d.drug2, note: d.note,
@@ -1242,21 +1319,110 @@ function submitQueue() {
       };
     })
   };
-  fetch('/api/submit', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) })
+}
+
+function clearAfterJob() {
+  selected = [];
+  if (document.getElementById('allergy-checkbox')) document.getElementById('allergy-checkbox').checked = false;
+  renderSelected();
+}
+
+function submitQueue() {
+  if (!selected.length) { showToast('กรุณาเลือกยาอย่างน้อย 1 รายการ'); return; }
+  var btn = document.getElementById('submit-btn');
+  var pbtn = document.getElementById('print-now-btn');
+  btn.disabled = true;
+  if (pbtn) pbtn.disabled = true;
+  fetch('/api/submit', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(buildJobBody()) })
     .then(function(r) { return r.json(); })
     .then(function(j) {
       btn.disabled = false;
+      if (pbtn) pbtn.disabled = false;
       if (!j.ok) { showToast(j.message || 'ส่งไม่สำเร็จ'); return; }
-      selected = [];
-      document.getElementById('allergy-checkbox').checked = false;
-      renderSelected();
+      clearAfterJob();
       showToast('✅ ส่งไปที่คิวพิมพ์ฉลากแล้ว');
     })
-    .catch(function() { btn.disabled = false; showToast('เชื่อมต่อ server ไม่ได้'); });
+    .catch(function() { btn.disabled = false; if (pbtn) pbtn.disabled = false; showToast('เชื่อมต่อ server ไม่ได้'); });
+}
+
+var printHostsCache = [];
+
+function loadPrintStations() {
+  var sel = document.getElementById('print-station');
+  if (!sel) return;
+  fetch('/api/print_info')
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      printHostsCache = (data && data.print_hosts) || [];
+      sel.innerHTML = '';
+      if (!printHostsCache.length) {
+        var o = document.createElement('option');
+        o.value = '';
+        o.textContent = (data && data.can_print_local === false)
+          ? '(ยังไม่ตั้งเครื่องพิมพ์บน PC)'
+          : '(ไม่มี station)';
+        sel.appendChild(o);
+        return;
+      }
+      var saved = localStorage.getItem('lp_print_station_id') || '';
+      printHostsCache.forEach(function(h, i) {
+        var o = document.createElement('option');
+        o.value = String(i);
+        o.textContent = h.name || h.url || ('station ' + (i + 1));
+        sel.appendChild(o);
+      });
+      var idx = 0;
+      if (saved) {
+        for (var i = 0; i < printHostsCache.length; i++) {
+          if (printHostsCache[i].id === saved) { idx = i; break; }
+        }
+      }
+      sel.selectedIndex = idx;
+    })
+    .catch(function() {
+      sel.innerHTML = '<option value="">(โหลด station ไม่ได้)</option>';
+    });
+}
+
+function printNow() {
+  if (!selected.length) { showToast('กรุณาเลือกยาอย่างน้อย 1 รายการ'); return; }
+  var btn = document.getElementById('print-now-btn');
+  var sbtn = document.getElementById('submit-btn');
+  var sel = document.getElementById('print-station');
+  var body = buildJobBody();
+  var hi = sel ? parseInt(sel.value, 10) : 0;
+  var host = (!isNaN(hi) && printHostsCache[hi]) ? printHostsCache[hi] : null;
+  if (host) {
+    if (host.id) localStorage.setItem('lp_print_station_id', host.id);
+    if (host.mode === 'host' && host.url) {
+      body.host_url = host.url;
+      if (host.default_printer) body.printer_name = host.default_printer;
+    } else if (host.default_printer) {
+      body.printer_name = host.default_printer;
+    }
+  }
+  btn.disabled = true;
+  if (sbtn) sbtn.disabled = true;
+  showToast('กำลังพิมพ์' + (host && host.name ? ' → ' + host.name : '') + '...');
+  fetch('/api/print_now', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) })
+    .then(function(r) { return r.json(); })
+    .then(function(j) {
+      btn.disabled = false;
+      if (sbtn) sbtn.disabled = false;
+      if (!j.ok) { showToast(j.message || 'พิมพ์ไม่สำเร็จ'); return; }
+      clearAfterJob();
+      showToast('✅ ' + (j.message || ('พิมพ์แล้ว ' + (j.printed || '') + ' แผ่น')));
+    })
+    .catch(function() {
+      btn.disabled = false;
+      if (sbtn) sbtn.disabled = false;
+      showToast('เชื่อมต่อ server ไม่ได้');
+    });
 }
 
 // ── Init ──────────────────────────────────────────────────────
 renderSelected();
+loadPrintStations();
 var savedStaff = localStorage.getItem('lp_staff_name');
 if (savedStaff) { showAppScreen(savedStaff); } else { showStaffScreen(); }
 </script>

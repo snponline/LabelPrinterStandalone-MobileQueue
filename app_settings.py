@@ -21,6 +21,14 @@ DEFAULTS = {
     "openai_api_key": "",
     "anthropic_api_key": "",
     "xai_api_key": "",
+    # Print host / station (LAN multi-printer)
+    "station_id": "",
+    "station_name": "",
+    "print_host_port": 8970,
+    # [{"id":"label-2","name":"หลังร้าน","url":"http://192.168.1.20:8970","default_printer":""}]
+    "remote_print_hosts": [],
+    # Desktop GUI print destination: "local" or remote host id
+    "desktop_print_target": "local",
 }
 
 

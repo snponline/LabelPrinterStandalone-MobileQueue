@@ -78,6 +78,12 @@ per-conversation).
 `APP_VERSION` in `label_gui.py` (shown in the window title bar) — bump it whenever a commit ships
 a user-visible feature/fix batch, since there's no other version indicator in this app.
 
+- **1.21.0** — Multi print host (parity with HOPE): settings register
+  `remote_print_hosts`, desktop target «พิมพ์จาก desktop ไปที่», mobile dropdown
+  **พิมพ์ที่** via `/api/print_info`, desktop print can POST PNG to another host.
+- **1.20.0** — Print host + dual role (Label App / Print host) like HOPE/PharmacyPOS.
+  Mobile: **ส่งเข้าคิว** (เดิม) + **พิมพ์เลย** (`POST /api/print_now`). Files:
+  `print_host_server.py`, `machine_role.py` (`role.json` under APP_DATA_DIR).
 - **1.19.0** — Warranty (ประกันอุปกรณ์) parity with HOPE: desktop list + add form,
   mobile `/warranty`, CSV import, and clear import/test or clear-all before customer deploy.
   Data in SQLite `warranties` table (`storage.py`); UI in `warranty_ui.py`.
