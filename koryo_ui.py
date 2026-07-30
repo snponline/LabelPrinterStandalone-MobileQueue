@@ -845,9 +845,23 @@ class KoryoMixin:
             return controlled, None, False
         tramadol_info = None
         if any(cat == "tramadol" for _, cat, _, _ in with_qty):
+            # Resolve the patient before looking up their previous details:
+            # a buyer linked on an earlier sale should be matched on
+            # patient_id (the green "found this customer" case), not fall
+            # through to matching the spelling of their name. Only an
+            # unambiguous single match counts - two people sharing a name are
+            # told apart by phone alone, and guessing would show one person's
+            # citizen ID while ringing up the other.
+            lookup_id = getattr(self, "_queue_patient_id", None)
+            if not lookup_id:
+                try:
+                    matches = storage.find_patients_by_exact_name(name)
+                except Exception:
+                    matches = []
+                if len(matches) == 1:
+                    lookup_id = matches[0]["id"]
             try:
-                prior = storage.get_last_tramadol_buyer_info(
-                    getattr(self, "_queue_patient_id", None), name)
+                prior = storage.get_last_tramadol_buyer_info(lookup_id, name)
             except Exception:
                 prior = None
             tramadol_info = self._ask_tramadol_buyer_info(parent, name, prior)
