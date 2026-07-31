@@ -638,9 +638,11 @@ class ReferralMixin:
         tk.Label(row2, text="(ระบุ ถ้าเลือกอื่นๆ)", font=("Tahoma", fs(8)), fg="#777").pack(side="left", padx=fs(4))
 
         _st = app_settings.load_settings() or {}
+        # No hospital baked in - this build ships to shops all over the country
+        # and each refers to a different one. Whatever is set in ตั้งค่า wins;
+        # otherwise the field starts empty.
         entry("สถานพยาบาลที่ส่งต่อ", "hospital",
-              value=_st.get("default_referral_hospital")
-              or "โรงพยาบาลสมเด็จพระยุพราชเวียงสระ")
+              value=_st.get("default_referral_hospital") or "")
 
         tk.Label(body, text="เหตุผลในการส่งต่อ", font=("Tahoma", fs(12), "bold"),
                  fg="#1a5a9a").pack(anchor="w", padx=fs(12), pady=(fs(10), fs(2)))
@@ -751,8 +753,7 @@ class ReferralMixin:
         names = pharmacist_choices()
         tk.Label(body, text="ชื่อเภสัชกรผู้ส่งต่อ",
                  font=("Tahoma", fs(10), "bold")).pack(anchor="w", **pad)
-        V["pharmacist_name"] = tk.StringVar(
-            value=_st.get("pharmacist_name") or (names[0] if names else ""))
+        V["pharmacist_name"] = tk.StringVar(value=names[0] if names else "")
         ttk.Combobox(body, textvariable=V["pharmacist_name"], values=names,
                      font=("Tahoma", fs(11))).pack(fill="x", **pad)
         entry("เลขที่ใบประกอบวิชาชีพ", "license_no", width=28,
