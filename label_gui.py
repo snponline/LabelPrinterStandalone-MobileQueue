@@ -35,6 +35,7 @@ import machine_role
 import print_host_server
 from warranty_ui import WarrantyMixin
 from koryo_ui import KoryoMixin
+from referral_ui import ReferralMixin
 
 # Runtime print-host bind address (set in main when role has print_host)
 PRINT_HOST_ADDR = (None, None)  # (ip, port)
@@ -1401,6 +1402,18 @@ def build_settings_dialog(parent, first_run=False):
     pharm_var = tk.StringVar(value=settings["pharmacist_names"])
     tk.Entry(win, textvariable=pharm_var, font=("Tahoma", fs(11))).pack(fill="x", **pad)
 
+    # ใบส่งต่อผู้ป่วย - the rest of that form's shop block reuses the fields above
+    ref_fr = tk.LabelFrame(win, text=" ใบส่งต่อผู้ป่วย ", font=("Tahoma", fs(9), "bold"),
+                           padx=fs(8), pady=fs(4))
+    ref_fr.pack(fill="x", padx=fs(10), pady=fs(6))
+    tk.Label(ref_fr, text="เลขที่ใบประกอบวิชาชีพ", font=("Tahoma", fs(10), "bold")).pack(anchor="w")
+    license_var = tk.StringVar(value=settings.get("license_no", ""))
+    tk.Entry(ref_fr, textvariable=license_var, font=("Tahoma", fs(11))).pack(fill="x")
+    tk.Label(ref_fr, text="สถานพยาบาลที่ส่งต่อประจำ (ค่าเริ่มต้นในใบส่งต่อ)",
+             font=("Tahoma", fs(10), "bold")).pack(anchor="w", pady=(fs(4), 0))
+    ref_hosp_var = tk.StringVar(value=settings.get("default_referral_hospital", ""))
+    tk.Entry(ref_fr, textvariable=ref_hosp_var, font=("Tahoma", fs(11))).pack(fill="x")
+
     tk.Label(
         win, text="API Key สำหรับ AI ช่วยค้นข้อมูล (ไม่บังคับ - ใส่เฉพาะตัวที่จะใช้)",
         font=("Tahoma", fs(10), "bold"), wraplength=fs(400), justify="left",
@@ -1456,6 +1469,8 @@ def build_settings_dialog(parent, first_run=False):
             "desktop_print_target": desk_target,
             "phone": phone_var.get().strip(),
             "pharmacist_names": pharm_var.get().strip(),
+            "license_no": license_var.get().strip(),
+            "default_referral_hospital": ref_hosp_var.get().strip(),
             **{ai_assist.PROVIDERS[k]["key_field"]: v.get().strip() for k, v in ai_key_vars.items()},
         })
         app_settings.save_settings(merged)
@@ -1587,7 +1602,7 @@ def build_settings_dialog(parent, first_run=False):
     return dialog_win
 
 
-class LabelApp(WarrantyMixin, KoryoMixin):
+class LabelApp(WarrantyMixin, KoryoMixin, ReferralMixin):
     def __init__(self, root):
         self.root = root
         root.title(f"พิมพ์ฉลากยา v{APP_VERSION}")
@@ -1655,6 +1670,10 @@ class LabelApp(WarrantyMixin, KoryoMixin):
         tk.Button(
             toolbar, text="📋 ข.ย.9/11", font=_tb["font"],
             bg="#7a4a1a", fg="white", command=self.open_koryo_report_dialog,
+        ).pack(side="left", padx=(0, fs(4)))
+        tk.Button(
+            toolbar, text="📨 ส่งต่อ", font=_tb["font"],
+            bg="#1a5a9a", fg="white", command=self.open_referral_dialog,
         ).pack(side="left", padx=(0, fs(4)))
         tk.Button(
             toolbar, text="📱 คิวมือถือ", font=_tb["font"],

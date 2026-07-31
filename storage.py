@@ -267,6 +267,31 @@ def _connect():
     conn.execute("CREATE INDEX IF NOT EXISTS idx_controlled_sales_category ON controlled_sales(category)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_controlled_sales_complete ON controlled_sales(info_complete)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_controlled_sales_patient ON controlled_sales(patient_id)")
+    # ใบส่งต่อผู้ป่วย (PhRF) - kept so the shop can reprint at the annual
+    # inspection instead of depending on the paper copy alone.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS referrals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            patient_id INTEGER,
+            patient_name TEXT NOT NULL,
+            gender TEXT, age TEXT, citizen_id TEXT, address TEXT, phone TEXT,
+            right_type TEXT, right_other TEXT, hospital TEXT,
+            reason_further INTEGER NOT NULL DEFAULT 0,
+            reason_drp INTEGER NOT NULL DEFAULT 0,
+            reason_followup INTEGER NOT NULL DEFAULT 0,
+            med_review TEXT, chief_complaint TEXT, illness_history TEXT,
+            chronic_disease TEXT, allergy_history TEXT, extra_info TEXT,
+            problem_found TEXT,
+            act_treat INTEGER NOT NULL DEFAULT 0, act_treat_text TEXT,
+            act_advice INTEGER NOT NULL DEFAULT 0, act_advice_text TEXT,
+            act_other INTEGER NOT NULL DEFAULT 0, act_other_text TEXT,
+            pharmacist_name TEXT, license_no TEXT,
+            referred_at TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_referrals_name ON referrals(patient_name)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_referrals_date ON referrals(referred_at)")
     return conn
 
 
@@ -2367,3 +2392,84 @@ def build_ky11_sheets(category, date_from=None, date_to=None):
             "lot_remaining": remaining_by_lot.get(lot_id) if lot_id else None,
         })
     return [sheets[k] for k in order]
+
+
+# ── ใบส่งต่อผู้ป่วย (PhRF) ────────────────────────────────────────────────────
+
+REFERRAL_FIELDS = [
+    "patient_id", "patient_name", "gender", "age", "citizen_id", "address", "phone",
+    "right_type", "right_other", "hospital",
+    "reason_further", "reason_drp", "reason_followup",
+    "med_review", "chief_complaint", "illness_history", "chronic_disease",
+    "allergy_history", "extra_info", "problem_found",
+    "act_treat", "act_treat_text", "act_advice", "act_advice_text",
+    "act_other", "act_other_text",
+    "pharmacist_name", "license_no", "referred_at",
+]
+
+_REFERRAL_FLAGS = {"reason_further", "reason_drp", "reason_followup",
+                   "act_treat", "act_advice", "act_other"}
+
+
+def save_referral(data):
+    """Insert one referral, returns its id."""
+    vals = []
+    for f in REFERRAL_FIELDS:
+        v = data.get(f)
+        if f == "patient_id":
+            vals.append(int(v) if v else None)
+        elif f in _REFERRAL_FLAGS:
+            vals.append(1 if v else 0)
+        else:
+            vals.append(v if v is not None else "")
+    cols = ", ".join(REFERRAL_FIELDS) + ", created_at"
+    marks = ", ".join("?" for _ in REFERRAL_FIELDS) + ", ?"
+    vals.append(datetime.now().isoformat(timespec="seconds"))
+    conn = _connect()
+    try:
+        cur = conn.execute(f"INSERT INTO referrals ({cols}) VALUES ({marks})", vals)
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def list_referrals(term="", limit=200):
+    """Most recent first, optionally filtered by patient name."""
+    conn = _connect()
+    try:
+        where, params = "", []
+        if (term or "").strip():
+            where = "WHERE patient_name LIKE ?"
+            params.append(f"%{term.strip()}%")
+        rows = conn.execute(
+            "SELECT id, patient_name, IFNULL(hospital, ''), referred_at, "
+            "       IFNULL(chief_complaint, '') "
+            f"FROM referrals {where} ORDER BY referred_at DESC, id DESC LIMIT ?",
+            (*params, int(limit)),
+        ).fetchall()
+        return [{"id": r[0], "patient_name": r[1], "hospital": r[2],
+                 "referred_at": str(r[3])[:16], "chief_complaint": r[4]} for r in rows]
+    finally:
+        conn.close()
+
+
+def get_referral(referral_id):
+    conn = _connect()
+    try:
+        row = conn.execute(
+            f"SELECT {', '.join(REFERRAL_FIELDS)} FROM referrals WHERE id = ?",
+            (int(referral_id),),
+        ).fetchone()
+    finally:
+        conn.close()
+    return dict(zip(REFERRAL_FIELDS, row)) if row else None
+
+
+def delete_referral(referral_id):
+    conn = _connect()
+    try:
+        conn.execute("DELETE FROM referrals WHERE id = ?", (int(referral_id),))
+        conn.commit()
+    finally:
+        conn.close()

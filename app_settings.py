@@ -18,6 +18,10 @@ DEFAULTS = {
     "address_line2": "",
     "phone": "",
     "pharmacist_names": "",
+    # ใบส่งต่อผู้ป่วย - the shop block on the form comes from the fields above;
+    # these two only exist there.
+    "license_no": "",
+    "default_referral_hospital": "",
     "openai_api_key": "",
     "anthropic_api_key": "",
     "xai_api_key": "",
