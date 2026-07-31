@@ -79,6 +79,20 @@ per-conversation).
 `APP_VERSION` in `label_gui.py` (shown in the window title bar) — bump it whenever a commit ships
 a user-visible feature/fix batch, since there's no other version indicator in this app.
 
+- **1.22.0** — ใบส่งต่อผู้ป่วย (PhRF), ported from HOPE as `referral_ui.py` + a `📨 ส่งต่อ` toolbar
+  button. Renderers and symptom picker carried over verbatim, so a referral written here prints
+  identically to one written on the desktop; the data layer underneath is SQLite (`referrals`
+  table in `storage.py`) instead of SQL Server, and the shop block on the printed sheet comes from
+  `app_settings` (`company_name`/`address_line1`/`address_line2`/`phone`) instead of
+  `label_gui.COMPANY_INFO`. The name box searches แฟ้มผู้ป่วย as you type over name/phone/HN
+  (prefix-priority, HN-only records) and picking one fills the phone, allergy note and recent
+  drugs. Symptoms are 8 groups / 42 items behind a dropdown, with a second "ใส่ลงช่อง" dropdown
+  naming which box the buttons write into. **No hospital is hardcoded in this build** — that
+  default belongs to the single HOPE install; here it comes from ตั้งค่า →
+  `default_referral_hospital` (with `license_no`, the only two settings keys this feature adds)
+  and starts empty. Verified end to end on a throwaway DB, never the live `data.db` — writes from
+  a tool process land in a sandbox copy of `%LOCALAPPDATA%`, so testing there proves nothing (see
+  `[[feedback-appdata-sandbox-redirect]]`).
 - **1.17.0** — New standalone `knowledge_manager.py` / `KnowledgeManager.exe` (built via new
   `build_knowledge_manager_exe.py`, own PyInstaller target) - deliberately a SEPARATE program from
   `LabelPrinter.exe`, per explicit user request, so non-technical staff can be handed just this one

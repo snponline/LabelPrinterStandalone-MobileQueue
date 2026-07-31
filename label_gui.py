@@ -60,7 +60,7 @@ def save_favorites(favorites):
         json.dump(favorites, f, ensure_ascii=False, indent=2)
 
 
-APP_VERSION = "1.21.0"
+APP_VERSION = "1.22.0"
 
 DOTS_PER_MM = 8  # matches standard 203dpi thermal label printers
 
