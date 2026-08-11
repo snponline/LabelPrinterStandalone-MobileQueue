@@ -78,6 +78,16 @@ def _connect():
             name TEXT UNIQUE NOT NULL
         )
     """)
+    # ฉลากเสริม - ฉลากข้อความล้วนที่ไม่ใช่ฉลากยา (ฉลากครีม, วิธีใช้อุปกรณ์)
+    # เก็บข้อความกับจำนวนชุดต่อ 1 สติกเกอร์ที่เหมาะกับฉลากนั้นไว้ใช้ซ้ำ
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS custom_labels (
+            name TEXT PRIMARY KEY,
+            body_text TEXT NOT NULL,
+            copies INTEGER NOT NULL DEFAULT 1,
+            updated_at TEXT NOT NULL
+        )
+    """)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS print_jobs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -299,7 +309,13 @@ def search_templates(term, limit=30):
     """Prefix-priority search over saved drug1 names (ชื่อการค้า) - also
     matches barcode, so scanning one (a barcode scanner is just a fast
     keyboard + Enter, nothing special to handle) surfaces the same result
-    a manual name search would."""
+    a manual name search would.
+
+    ยาที่พิมพ์ฉลากบ่อยขึ้นก่อน แต่มาหลังการเรียงแบบ "ขึ้นต้นด้วยคำที่พิมพ์" เสมอ -
+    คนพิมพ์ชื่อยาที่ต้องการมาแล้ว ไม่ควรถูกยาตัวอื่นที่ใช้บ่อยกว่าแย่งที่
+    นับจาก print_job_items ที่มีอยู่แล้ว ไม่ต้องมีตารางนับแยกและไม่ต้อง backfill
+    (เรียงใน SQL ไม่ใช่มาเรียงทีหลัง เพราะ LIMIT ตัดผลตั้งแต่ในฐานข้อมูล)
+    """
     term = (term or "").strip()
     if not term:
         return []
@@ -309,9 +325,15 @@ def search_templates(term, limit=30):
         like = f"%{term}%"
         cur.execute(
             """
-            SELECT id, drug1 FROM drug_templates
-            WHERE drug1 LIKE ? OR barcode LIKE ?
-            ORDER BY CASE WHEN drug1 LIKE ? THEN 0 ELSE 1 END, drug1
+            SELECT t.id, t.drug1
+            FROM drug_templates t
+            LEFT JOIN (
+                SELECT idproduct, COUNT(*) AS n FROM print_job_items
+                WHERE idproduct IS NOT NULL GROUP BY idproduct
+            ) f ON f.idproduct = t.id
+            WHERE t.drug1 LIKE ? OR t.barcode LIKE ?
+            ORDER BY CASE WHEN t.drug1 LIKE ? THEN 0 ELSE 1 END,
+                     IFNULL(f.n, 0) DESC, t.drug1
             LIMIT ?
             """,
             (like, like, f"{term}%", limit),
@@ -2470,6 +2492,50 @@ def delete_referral(referral_id):
     conn = _connect()
     try:
         conn.execute("DELETE FROM referrals WHERE id = ?", (int(referral_id),))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ── ฉลากเสริม (custom text labels) ───────────────────────────────────────────
+
+
+def list_custom_labels(term=""):
+    conn = _connect()
+    try:
+        if (term or "").strip():
+            rows = conn.execute(
+                "SELECT name, body_text, copies FROM custom_labels "
+                "WHERE name LIKE ? ORDER BY name", (f"%{term.strip()}%",)).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT name, body_text, copies FROM custom_labels ORDER BY name").fetchall()
+        return [{"name": r[0], "body_text": r[1] or "", "copies": int(r[2] or 1)} for r in rows]
+    finally:
+        conn.close()
+
+
+def save_custom_label(name, body_text, copies):
+    """upsert - ชื่อเดิมคือทับของเดิม รวมจำนวนชุดที่เพิ่งเลือกด้วย"""
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("ต้องตั้งชื่อฉลากก่อน")
+    conn = _connect()
+    try:
+        conn.execute(
+            "INSERT INTO custom_labels (name, body_text, copies, updated_at) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(name) DO UPDATE SET body_text = excluded.body_text, "
+            "copies = excluded.copies, updated_at = excluded.updated_at",
+            (name, body_text or "", int(copies or 1), datetime.now().isoformat(timespec="seconds")))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def delete_custom_label(name):
+    conn = _connect()
+    try:
+        conn.execute("DELETE FROM custom_labels WHERE name = ?", ((name or "").strip(),))
         conn.commit()
     finally:
         conn.close()

@@ -222,22 +222,38 @@ def render_ky11_sheet_html(sheet, category):
         for s in sheet["sales"]
     ) or '<tr><td colspan="8" style="color:#666;">ไม่มีรายการขาย</td></tr>'
     sources = " · ".join(sheet["sources"]) if sheet["sources"] else "-"
+    # หัวเรื่อง (ชื่อยา/หน่วย/แหล่งซื้อ/ตาราง Lot) อยู่ใน <thead> ไม่ใช่ <div>
+    # ข้างบนตาราง เพราะเบราว์เซอร์จะพิมพ์ thead ซ้ำทุกหน้าที่ตารางล้นไป -
+    # ใบที่ต้องเซ็นทุกแผ่นจึงมีชื่อยาและ Lot กำกับ ไม่ใช่มีแค่แผ่นแรก
+    #
+    # ต้องมี <colgroup>: ตารางนี้เป็น table-layout:fixed ซึ่งกำหนดความกว้างจาก
+    # แถวแรก แถวแรกตอนนี้เป็น cell เดียว colspan=8 ถ้าไม่ระบุ colgroup คอลัมน์
+    # จะถูกหารเท่ากันหมด ความกว้างที่จัดไว้จะพังทั้งตาราง
     return f"""
     <div style="border:1px solid #ccc;padding:12px;margin-bottom:20px;background:#fff;">
-      <div style="font-weight:800;margin-bottom:6px;">แบบ ข.ย.11 บัญชีการขายยาอันตราย</div>
-      <div style="font-size:0.95em;line-height:1.7;margin-bottom:4px;">
-        ชื่อยา: <b>{ky_html_escape(sheet['product_name'])}</b>
-        &nbsp;|&nbsp; หน่วย: {ky_html_escape(sheet['unit_name'] or '-')}
-        &nbsp;|&nbsp; แหล่งซื้อ: {ky_html_escape(sources)}
-      </div>
-      {lots_html}
       <table>
-        <thead><tr>
-          <th class="nw" style="width:3.5%;">#</th><th class="nw" style="width:10%;">วันที่ขาย</th>
-          <th class="nw num" style="width:7%;">จำนวน</th><th class="nw" style="width:9%;">หน่วย</th>
-          <th class="nw" style="width:9%;">Lot</th><th style="width:40%;">ชื่อ-สกุลผู้ซื้อ</th>
-          <th style="width:14.5%;">ลายเซ็นผู้มีหน้าที่ปฏิบัติการ</th><th style="width:7%;">หมายเหตุ</th>
-        </tr></thead>
+        <colgroup>
+          <col style="width:3.5%"><col style="width:10%"><col style="width:7%">
+          <col style="width:9%"><col style="width:9%"><col style="width:40%">
+          <col style="width:14.5%"><col style="width:7%">
+        </colgroup>
+        <thead>
+          <tr><td colspan="8" style="border:none;padding:0 0 8px;background:#fff;">
+            <div style="font-weight:800;margin-bottom:6px;">แบบ ข.ย.11 บัญชีการขายยาอันตราย</div>
+            <div style="font-size:0.95em;line-height:1.7;margin-bottom:4px;">
+              ชื่อยา: <b>{ky_html_escape(sheet['product_name'])}</b>
+              &nbsp;|&nbsp; หน่วย: {ky_html_escape(sheet['unit_name'] or '-')}
+              &nbsp;|&nbsp; แหล่งซื้อ: {ky_html_escape(sources)}
+            </div>
+            {lots_html}
+          </td></tr>
+          <tr>
+            <th class="nw">#</th><th class="nw">วันที่ขาย</th>
+            <th class="nw num">จำนวน</th><th class="nw">หน่วย</th>
+            <th class="nw">Lot</th><th>ชื่อ-สกุลผู้ซื้อ</th>
+            <th>ลายเซ็นผู้มีหน้าที่ปฏิบัติการ</th><th>หมายเหตุ</th>
+          </tr>
+        </thead>
         <tbody>{sales_rows}</tbody>
       </table>
     </div>

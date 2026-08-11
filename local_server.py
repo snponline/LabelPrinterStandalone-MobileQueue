@@ -213,7 +213,16 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 self._send_json({"ok": True, "name": name, "drugs": favorites[name]})
             else:
-                out = [{"name": n, "count": len(d)} for n, d in favorites.items()]
+                # groups = จำนวน "กลุ่มเลือก" ในชุดนั้น (หน้าเว็บเอาไปโชว์ต่อท้ายชื่อ)
+                # ให้มือถือรู้ล่วงหน้าว่าชุดไหนต้องถามก่อนโหลด
+                out = [
+                    {
+                        "name": n,
+                        "count": len(d),
+                        "groups": len({e.get("choice_group") for e in d if e.get("choice_group")}),
+                    }
+                    for n, d in favorites.items()
+                ]
                 out.sort(key=lambda r: r["name"])
                 self._send_json(out)
 
@@ -710,6 +719,17 @@ QUEUE_PAGE_HTML = r"""<!DOCTYPE html>
   .fav-item { display:flex; align-items:center; justify-content:space-between; gap:10px; padding:14px 12px; background:var(--bg); border:1px solid var(--border); border-radius:10px; margin-bottom:8px; cursor:pointer; }
   .fav-item:active { background:#eef2f1; }
   .fav-item .fav-name { font-size:15px; font-weight:600; }
+  .fav-fixed { font-size:13px; color:#1a7a4a; background:#eef7f1; border-radius:8px; padding:10px 12px; margin-bottom:10px; line-height:1.5; }
+  .fav-group { border:1px solid var(--border); border-radius:10px; padding:10px 12px; margin-bottom:10px; }
+  .fav-group-title { font-size:13px; font-weight:700; color:var(--muted); margin-bottom:6px; }
+  .fav-opt { display:flex; align-items:flex-start; gap:10px; padding:10px 4px; cursor:pointer; border-bottom:1px solid #f0f2f5; }
+  .fav-opt:last-child { border-bottom:none; }
+  .fav-opt.none span { color:var(--muted); }
+  .fav-actions { display:flex; gap:8px; margin-top:4px; }
+  .fav-actions button { flex:1; padding:12px; border:none; border-radius:10px; font-family:inherit; font-size:14px; font-weight:700; }
+  .fav-go { background:var(--primary); color:#fff; }
+  .fav-all { background:#e5e7eb; color:var(--text); }
+  .fav-hint { font-size:11px; color:var(--muted); margin-top:6px; line-height:1.5; }
   .fav-item .fav-count { font-size:12px; color:var(--muted); }
   .modal-close-btn { width:100%; padding:12px; margin-top:4px; border:none; border-radius:8px; background:#e5e7eb; color:var(--text); font-weight:700; font-size:15px; cursor:pointer; }
 
@@ -806,9 +826,9 @@ QUEUE_PAGE_HTML = r"""<!DOCTYPE html>
 
 <div class="overlay" id="fav-overlay" onclick="if(event.target===this) closeFavPicker()">
   <div class="modal-card">
-    <h3>⭐ เลือก Favorite</h3>
+    <h3 id="fav-title">⭐ เลือก Favorite</h3>
     <div id="fav-list"></div>
-    <button class="modal-close-btn" onclick="closeFavPicker()">ปิด</button>
+    <button class="modal-close-btn" id="fav-close-btn" onclick="closeFavPicker()">ปิด</button>
   </div>
 </div>
 
@@ -1010,6 +1030,7 @@ function pickResult(i) {
 
 // ── Favorites ─────────────────────────────────────────────────
 function openFavPicker() {
+  showFavListView();
   document.getElementById('fav-list').innerHTML = '<div class="empty-hint">กำลังโหลด...</div>';
   document.getElementById('fav-overlay').classList.add('show');
   fetch('/api/favorites')
@@ -1024,7 +1045,8 @@ function renderFavList(list) {
   if (!list.length) { el.innerHTML = '<div class="empty-hint">ยังไม่มี Favorite</div>'; return; }
   el.innerHTML = list.map(function(f, i) {
     return '<div class="fav-item" onclick="pickFavorite(' + i + ')">'
-      + '<span class="fav-name">' + escHtml(f.name) + '</span>'
+      + '<span class="fav-name">' + escHtml(f.name)
+      + (f.groups ? ' <span class="fav-pick">(+เลือก ' + f.groups + ')</span>' : '') + '</span>'
       + '<span class="fav-count">' + f.count + ' รายการ</span>'
       + '</div>';
   }).join('');
@@ -1038,23 +1060,111 @@ function pickFavorite(i) {
     .then(function(r) { return r.json(); })
     .then(function(j) {
       if (!j.ok) { showToast(j.message || 'โหลด Favorite ไม่สำเร็จ'); return; }
-      (j.drugs || []).forEach(function(d) {
-        selected.push({
-          idproduct: d.idproduct,
-          hasInfo: d.status ? d.status === 'db' : true,
-          drug1: d.drug1 || '', drug2: d.drug2 || '', note: d.note || '',
-          qty: d.qty || '', unit: d.unit || 'เม็ด', per_day: d.per_day || '',
-          every_hr: d.every_hr || '', meal: d.meal || '',
-          times: Array.isArray(d.times) ? d.times : [],
-          extra_labels: Array.isArray(d.extra_labels) ? d.extra_labels : [],
-          usage_mode: d.usage_mode || 'oral',
-        });
-      });
-      renderSelected();
-      closeFavPicker();
-      showToast('เพิ่ม Favorite "' + fav.name + '" แล้ว (' + (j.drugs || []).length + ' รายการ)');
+      var drugs = j.drugs || [];
+      var hasGroups = drugs.some(function(d) { return d.choice_group; });
+      if (hasGroups) renderFavChoices(fav.name, drugs);
+      else addFavDrugs(fav.name, drugs);
     })
     .catch(function() { showToast('เชื่อมต่อ server ไม่ได้'); });
+}
+
+// ชุดที่มี "กลุ่มเลือก" - ถามก่อนว่าจะเอาตัวไหนในแต่ละกลุ่ม
+// พอร์ตจาก label_gui.py `_ask_favorite_choices()` ให้พฤติกรรมตรงกับ desktop
+function renderFavChoices(name, drugs) {
+  window._favChoiceCtx = { name: name, drugs: drugs };
+
+  var fixed = [], groups = {}, order = [];
+  drugs.forEach(function(d, idx) {
+    var gid = parseInt(d.choice_group || 0, 10) || 0;
+    if (gid) {
+      if (!groups[gid]) { groups[gid] = []; order.push(gid); }
+      groups[gid].push({ d: d, idx: idx });   // idx = ลำดับเดิมในชุด ใช้เรียงกลับตอนโหลด
+    } else {
+      fixed.push({ d: d, idx: idx });
+    }
+  });
+  order.sort(function(a, b) { return a - b; });
+
+  var html = '';
+  if (fixed.length) {
+    html += '<div class="fav-fixed"><b>ตัวคงที่:</b> '
+      + fixed.map(function(f) { return escHtml(f.d.drug1 || '(ไม่มีชื่อ)'); }).join(', ')
+      + '</div>';
+  }
+  order.forEach(function(gid) {
+    html += '<div class="fav-group"><div class="fav-group-title">กลุ่มเลือก ' + gid + '</div>';
+    groups[gid].forEach(function(o, i) {
+      // default = ตัวแรกของกลุ่ม เหมือน desktop
+      html += '<label class="fav-opt"><input type="radio" name="favg' + gid + '" value="' + o.idx + '"'
+        + (i === 0 ? ' checked' : '') + '>'
+        + '<span>' + escHtml(o.d.drug1 || '(ไม่มีชื่อ)') + '</span></label>';
+    });
+    html += '<label class="fav-opt none"><input type="radio" name="favg' + gid + '" value="-1">'
+      + '<span>— ไม่เอาสักตัว —</span></label>';
+    html += '</div>';
+  });
+
+  html += '<div class="fav-actions">'
+    + '<button class="fav-go" onclick="confirmFavChoices()">โหลดรายการนี้</button>'
+    + '<button class="fav-all" onclick="loadFavAll()">เอาทั้งหมด</button>'
+    + '</div>'
+    + '<div class="fav-hint">«เอาทั้งหมด» = ดึงตัวเลือกทุกตัวเข้ารายการ แล้วลบตัวที่ไม่เอาออกเองทีหลัง</div>';
+
+  document.getElementById('fav-list').innerHTML = html;
+  document.getElementById('fav-title').textContent = 'ชุด «' + name + '» มียาให้เลือก ' + order.length + ' กลุ่ม';
+  document.getElementById('fav-close-btn').textContent = '← กลับไปเลือกชุดอื่น';
+  document.getElementById('fav-close-btn').setAttribute('onclick', 'openFavPicker()');
+}
+
+function confirmFavChoices() {
+  var ctx = window._favChoiceCtx;
+  if (!ctx) return;
+  var keep = {};
+  ctx.drugs.forEach(function(d, idx) {
+    if (!(parseInt(d.choice_group || 0, 10) || 0)) keep[idx] = true;   // ตัวคงที่ เอาเสมอ
+  });
+  var radios = document.querySelectorAll('#fav-list input[type=radio]:checked');
+  Array.prototype.forEach.call(radios, function(r) {
+    var idx = parseInt(r.value, 10);
+    if (idx >= 0) keep[idx] = true;                                     // -1 = ไม่เอาสักตัว
+  });
+  // เรียงตามลำดับเดิมในชุด ตัวที่เลือกจะได้อยู่ตำแหน่งที่ตั้งใจไว้ (เหมือน desktop)
+  var chosen = ctx.drugs.filter(function(d, idx) { return keep[idx]; });
+  if (!chosen.length) { showToast('ยังไม่ได้เลือกยาสักตัว'); return; }
+  addFavDrugs(ctx.name, chosen);
+}
+
+function loadFavAll() {
+  var ctx = window._favChoiceCtx;
+  if (!ctx) return;
+  addFavDrugs(ctx.name, ctx.drugs);
+}
+
+function addFavDrugs(name, drugs) {
+  drugs.forEach(function(d) {
+    selected.push({
+      idproduct: d.idproduct,
+      hasInfo: d.status ? d.status === 'db' : true,
+      drug1: d.drug1 || '', drug2: d.drug2 || '', note: d.note || '',
+      qty: d.qty || '', unit: d.unit || 'เม็ด', per_day: d.per_day || '',
+      every_hr: d.every_hr || '', meal: d.meal || '',
+      times: Array.isArray(d.times) ? d.times : [],
+      extra_labels: Array.isArray(d.extra_labels) ? d.extra_labels : [],
+      usage_mode: d.usage_mode || 'oral',
+    });
+  });
+  renderSelected();
+  closeFavPicker();
+  showFavListView();
+  showToast('เพิ่ม Favorite "' + name + '" แล้ว (' + drugs.length + ' รายการ)');
+}
+
+// คืนหน้าต่างกลับเป็นรายการชุด - ครั้งหน้าเปิดมาจะได้ไม่ค้างอยู่หน้าเลือก
+function showFavListView() {
+  var t = document.getElementById('fav-title');
+  var b = document.getElementById('fav-close-btn');
+  if (t) t.textContent = '⭐ เลือก Favorite';
+  if (b) { b.textContent = 'ปิด'; b.setAttribute('onclick', 'closeFavPicker()'); }
 }
 
 // ── Patient profile (ประวัติผู้ป่วย) ─────────────────────────────

@@ -60,7 +60,7 @@ def save_favorites(favorites):
         json.dump(favorites, f, ensure_ascii=False, indent=2)
 
 
-APP_VERSION = "1.22.0"
+APP_VERSION = "1.23.0"
 
 DOTS_PER_MM = 8  # matches standard 203dpi thermal label printers
 
@@ -636,6 +636,66 @@ ZH_STRINGS = {
     "pharm_label": "药师",
 }
 LANG_STRINGS = {"en": EN_STRINGS, "mm": MM_STRINGS, "zh": ZH_STRINGS}
+
+
+def build_custom_label_image(text, copies, settings):
+    """ฉลากข้อความล้วน วางซ้ำ N ชุดลงบนสติกเกอร์ใบเดียว
+
+    สติกเกอร์ใหญ่เกินไปสำหรับข้อความ 2 บรรทัด เหลือที่ว่างด้านล่างเยอะ -
+    วางซ้ำหลายชุดแล้วตัดแบ่งทีหลังคุ้มกว่า มีเส้นประคั่นให้ตัดตรง
+
+    ขนาดฉลากอ่านจาก settings (build นี้ตั้งขนาดเองได้ ไม่ได้ฟิกซ์ 80x50 แบบ HOPE)
+    ขนาดตัวอักษรเลือกอัตโนมัติ ไล่จากใหญ่ลงมาจนใส่ได้พอดีทั้งกว้างและสูง
+    """
+    label_w_px = int(settings["label_w_mm"]) * DOTS_PER_MM
+    label_h_px = int(settings["label_h_mm"]) * DOTS_PER_MM
+    copies = max(1, min(int(copies or 1), 8))
+    img = Image.new("L", (label_w_px, label_h_px), 255)
+    draw = ImageDraw.Draw(img)
+    lang = detect_font_lang(text)
+    margin_x = max(8, label_w_px // 46)
+    max_w = label_w_px - 2 * margin_x
+    block_h = label_h_px // copies
+
+    def wrap(font):
+        out = []
+        for para in (text or "").replace("\r\n", "\n").split("\n"):
+            para = para.strip()
+            if not para:
+                continue
+            cur = ""
+            for w in para.split(" "):
+                trial = (cur + " " + w).strip()
+                if draw.textlength(trial, font=font) <= max_w or not cur:
+                    cur = trial
+                else:
+                    out.append(cur)
+                    cur = w
+            if cur:
+                out.append(cur)
+        return out
+
+    lines, font, line_h = [], None, 0
+    for size in range(34, 9, -1):
+        font = find_font(size, bold=True, lang=lang)
+        lines = wrap(font)
+        line_h = int(size * 1.45)
+        if lines and len(lines) * line_h <= block_h - 8:
+            break
+    if not lines:
+        lines = ["(ยังไม่ได้ใส่ข้อความ)"]
+
+    for c in range(copies):
+        top = c * block_h
+        if c:
+            for xx in range(margin_x, label_w_px - margin_x, 12):
+                draw.line([(xx, top), (xx + 6, top)], fill=0, width=1)
+        y = top + max(2, (block_h - len(lines) * line_h) // 2)
+        for ln in lines:
+            w = draw.textlength(ln, font=font)
+            draw_thai_text(draw, ((label_w_px - w) // 2, y), ln, font)
+            y += line_h
+    return img
 
 
 def build_label_image(data, settings):
@@ -1672,6 +1732,10 @@ class LabelApp(WarrantyMixin, KoryoMixin, ReferralMixin):
             bg="#7a4a1a", fg="white", command=self.open_koryo_report_dialog,
         ).pack(side="left", padx=(0, fs(4)))
         tk.Button(
+            toolbar, text="🏷 ฉลากเสริม", font=_tb["font"],
+            command=self.open_custom_label_dialog,
+        ).pack(side="left", padx=(0, fs(4)))
+        tk.Button(
             toolbar, text="📨 ส่งต่อ", font=_tb["font"],
             bg="#1a5a9a", fg="white", command=self.open_referral_dialog,
         ).pack(side="left", padx=(0, fs(4)))
@@ -2077,6 +2141,155 @@ class LabelApp(WarrantyMixin, KoryoMixin, ReferralMixin):
         self.refresh_selected_list()
         self.open_edit_dialog(index, is_new=True)
 
+    def open_custom_label_dialog(self):
+        """ฉลากเสริมที่ไม่ใช่ฉลากยา - พิมพ์ข้อความอะไรก็ได้ลงสติกเกอร์
+
+        ตั้งชื่อเก็บไว้ใช้ซ้ำได้ (ค้นได้เหมือนค้นยา) และจำจำนวน copy ที่เหมาะกับ
+        ฉลากนั้นไว้ด้วย - ข้อความสั้นๆ 2 บรรทัดใส่ได้ 3-4 ชุดต่อสติกเกอร์ 1 ใบ
+        ตัดแบ่งทีหลัง ไม่ต้องเปลืองสติกเกอร์ทั้งใบต่อ 1 ข้อความ
+        """
+        win = tk.Toplevel(self.root)
+        win.title("ฉลากเสริม (ไม่ใช่ฉลากยา)")
+        win.geometry(f"{fs(760)}x{fs(600)}")
+        win.transient(self.root)
+
+        left = tk.Frame(win)
+        left.pack(side="left", fill="both", expand=True, padx=fs(10), pady=fs(10))
+        right = tk.Frame(win, width=fs(230))
+        right.pack(side="right", fill="y", padx=(0, fs(10)), pady=fs(10))
+        right.pack_propagate(False)
+
+        # ── ฉลากที่เคยบันทึกไว้ (ค้นได้) ──────────────────────────────────
+        tk.Label(right, text="ฉลากที่บันทึกไว้", font=("Tahoma", fs(10), "bold")).pack(anchor="w")
+        search_var = tk.StringVar()
+        tk.Entry(right, textvariable=search_var, font=("Tahoma", fs(10))).pack(fill="x", pady=fs(3))
+        saved_list = tk.Listbox(right, font=("Tahoma", fs(9)), exportselection=False)
+        saved_list.pack(fill="both", expand=True, pady=fs(3))
+        saved = []
+
+        def refresh_saved(*_a):
+            saved.clear()
+            saved.extend(storage.list_custom_labels(search_var.get()))
+            saved_list.delete(0, tk.END)
+            for it in saved:
+                saved_list.insert(tk.END, f"{it['name']}  ({it['copies']} ชุด)")
+
+        search_var.trace_add("write", refresh_saved)
+
+        # ── ฟอร์ม ────────────────────────────────────────────────────────
+        tk.Label(left, text="ชื่อฉลาก", font=("Tahoma", fs(10), "bold")).pack(anchor="w")
+        name_var = tk.StringVar()
+        tk.Entry(left, textvariable=name_var, font=("Tahoma", fs(11))).pack(fill="x", pady=(0, fs(6)))
+
+        tk.Label(left, text="ข้อความบนฉลาก (ขึ้นบรรทัดใหม่ได้)",
+                 font=("Tahoma", fs(10), "bold")).pack(anchor="w")
+        text_box = tk.Text(left, font=("Tahoma", fs(11)), height=5)
+        text_box.pack(fill="x", pady=(0, fs(6)))
+
+        row = tk.Frame(left)
+        row.pack(fill="x", pady=(0, fs(6)))
+        tk.Label(row, text="จำนวนชุดต่อ 1 สติกเกอร์", font=("Tahoma", fs(10), "bold")).pack(side="left")
+        copies_var = tk.IntVar(value=3)
+        tk.Spinbox(row, from_=1, to=8, textvariable=copies_var, width=4,
+                   font=("Tahoma", fs(11))).pack(side="left", padx=fs(8))
+        tk.Label(row, text="(มีเส้นประคั่นให้ตัด)", font=("Tahoma", fs(8)),
+                 fg="#777").pack(side="left")
+
+        preview_holder = tk.Label(left, bd=2, relief="solid")
+        preview_holder.pack(pady=fs(6))
+        status = tk.StringVar()
+        tk.Label(left, textvariable=status, font=("Tahoma", fs(9)), fg="#1a5a9a").pack(anchor="w")
+
+        def current_text():
+            return text_box.get("1.0", "end").strip()
+
+        def redraw(*_a):
+            img = build_custom_label_image(current_text(), copies_var.get(),
+                                           app_settings.load_settings())
+            shown = img
+            photo = ImageTk.PhotoImage(shown)
+            preview_holder.config(image=photo)
+            preview_holder.image = photo
+
+        text_box.bind("<KeyRelease>", redraw)
+        copies_var.trace_add("write", lambda *a: redraw())
+
+        def load_selected(_e=None):
+            sel = saved_list.curselection()
+            if not sel:
+                return
+            it = saved[sel[0]]
+            name_var.set(it["name"])
+            text_box.delete("1.0", "end")
+            text_box.insert("1.0", it["body_text"])
+            copies_var.set(it["copies"] or 1)
+            redraw()
+            status.set(f"โหลด «{it['name']}» แล้ว")
+
+        saved_list.bind("<<ListboxSelect>>", load_selected)
+
+        def do_save():
+            if not name_var.get().strip():
+                status.set("ตั้งชื่อฉลากก่อนถึงจะบันทึกได้")
+                return
+            if not current_text():
+                status.set("ยังไม่ได้ใส่ข้อความ")
+                return
+            try:
+                storage.save_custom_label(name_var.get(), current_text(), copies_var.get())
+            except Exception as e:
+                messagebox.showerror("ผิดพลาด", f"บันทึกไม่สำเร็จ: {e}", parent=win)
+                return
+            refresh_saved()
+            status.set(f"บันทึก «{name_var.get().strip()}» แล้ว "
+                       f"(ค่าเริ่มต้น {copies_var.get()} ชุด)")
+
+        def do_delete():
+            if not name_var.get().strip():
+                return
+            if not messagebox.askyesno("ยืนยัน", f"ลบฉลาก «{name_var.get().strip()}» ?", parent=win):
+                return
+            storage.delete_custom_label(name_var.get())
+            refresh_saved()
+            status.set("ลบแล้ว")
+
+        def do_print():
+            if not current_text():
+                status.set("ยังไม่ได้ใส่ข้อความ")
+                return
+            img = build_custom_label_image(current_text(), copies_var.get(),
+                                           app_settings.load_settings())
+            try:
+                print_label_pages(img, copies=1)
+            except Exception as e:
+                messagebox.showerror("พิมพ์ไม่สำเร็จ", str(e), parent=win)
+                return
+            # บันทึกให้อัตโนมัติถ้าตั้งชื่อไว้ - จำนวนชุดที่เพิ่งพิมพ์กลายเป็นค่า
+            # เริ่มต้นครั้งหน้า ตามที่ตั้งใจไว้ว่า "ลองดูว่ากี่ชุดพอดีแล้วจำไว้"
+            if name_var.get().strip():
+                try:
+                    storage.save_custom_label(name_var.get(), current_text(), copies_var.get())
+                    refresh_saved()
+                except Exception:
+                    pass
+            status.set(f"สั่งพิมพ์แล้ว ({copies_var.get()} ชุดต่อสติกเกอร์)")
+
+        btns = tk.Frame(left)
+        btns.pack(fill="x", pady=fs(8))
+        tk.Button(btns, text="🖨 พิมพ์", font=("Tahoma", fs(11), "bold"), bg="#1a7a4a", fg="white",
+                  command=do_print).pack(side="left")
+        tk.Button(btns, text="💾 บันทึกชื่อนี้", font=("Tahoma", fs(10)),
+                  command=do_save).pack(side="left", padx=fs(6))
+        tk.Button(btns, text="🗑 ลบ", font=("Tahoma", fs(10)), fg="#b03a2e",
+                  command=do_delete).pack(side="left")
+        tk.Button(btns, text="ปิด", font=("Tahoma", fs(10)),
+                  command=win.destroy).pack(side="right")
+
+        refresh_saved()
+        redraw()
+        win.lift()
+        win.focus_force()
+
     def open_import_excel_dialog(self):
         """Bulk-create blank drug templates (ชื่อการค้า + optional
         บาร์โค้ด/ชื่อสามัญ) from an Excel file - for a pharmacy migrating a
@@ -2433,8 +2646,13 @@ class LabelApp(WarrantyMixin, KoryoMixin, ReferralMixin):
             for name in names:
                 row = tk.Frame(self.fav_button_frame, bg="#f0f0f0")
                 row.pack(fill="x", pady=fs(2))
+                # ต่อท้ายชื่อว่ามีกลุ่มให้เลือกกี่กลุ่ม - จะได้รู้ก่อนกดว่าชุดนี้
+                # จะเด้งหน้าต่างถามหรือโหลดเข้ารายการเลย
+                n_groups = len({e.get("choice_group") for e in self.favorites.get(name, [])
+                                if e.get("choice_group")})
                 tk.Button(
-                    row, text=name, font=("Tahoma", fs(9)), wraplength=fs(140), justify="left", anchor="w",
+                    row, text=name + (f"  (+เลือก {n_groups})" if n_groups else ""),
+                    font=("Tahoma", fs(9)), wraplength=fs(140), justify="left", anchor="w",
                     bg="#ffffff", relief="raised", command=lambda n=name: self.on_load_favorite(n),
                 ).pack(side="left", fill="x", expand=True)
                 tk.Button(
@@ -2449,10 +2667,164 @@ class LabelApp(WarrantyMixin, KoryoMixin, ReferralMixin):
         self._bind_mousewheel(self.fav_button_frame, self._fav_canvas)
         self._bind_mousewheel(self._fav_canvas, self._fav_canvas)
 
+    def _ask_favorite_groups(self, name):
+        """ตอนบันทึก Favorite - ถามว่ายาตัวไหน "คงที่" ตัวไหนอยู่ "กลุ่มเลือก"
+
+        คืน {index ในรายการ: หมายเลขกลุ่ม} (0 = คงที่) หรือ None ถ้ากดยกเลิก
+        ถ้ามียาตัวเดียวก็ข้ามไปเลย ไม่มีอะไรให้จัดกลุ่ม
+        """
+        drugs = self.selected_drugs
+        if len(drugs) < 2:
+            return {}
+
+        win = tk.Toplevel(self.root)
+        win.title(f"จัดกลุ่มยาใน Favorite - {name}")
+        win.transient(self.root)
+        win.grab_set()
+        tk.Label(win, text="ยาตัวไหนโหลดทุกครั้ง ตัวไหนให้เลือกตอนใช้งาน?",
+                 font=("Tahoma", fs(11), "bold")).pack(anchor="w", padx=fs(14), pady=(fs(12), fs(2)))
+        tk.Label(win, text="ยาที่อยู่กลุ่มเลือกเดียวกัน = เลือกได้แค่ 1 ตัวตอนโหลด "
+                           "(เช่น ยาแก้ปวด 3 ยี่ห้อ ใส่กลุ่ม 1 ทั้งหมด)\n"
+                           "ถ้าไม่ต้องการฟีเจอร์นี้ ปล่อยเป็น «คงที่» ทุกตัวแล้วกดบันทึกได้เลย",
+                 font=("Tahoma", fs(9)), fg="#666", wraplength=fs(470),
+                 justify="left").pack(anchor="w", padx=fs(14), pady=(0, fs(8)))
+
+        # กลุ่มที่เคยตั้งไว้ใน Favorite ชื่อนี้ - ใช้ตั้งค่าเริ่มต้นให้ตรงกับของเดิม
+        # ไม่งั้นเปิดมาเป็น "คงที่" หมดทุกครั้ง แล้วกดบันทึกทับทีไรกลุ่มหายทุกที
+        prev = {}
+        for e in self.favorites.get(name, []):
+            if e.get("choice_group") and e.get("idproduct"):
+                prev[e["idproduct"]] = int(e["choice_group"])
+
+        opts = ["คงที่", "กลุ่มเลือก 1", "กลุ่มเลือก 2", "กลุ่มเลือก 3"]
+        vars_ = []
+        body = tk.Frame(win)
+        body.pack(fill="both", expand=True, padx=fs(14))
+        for i, d in enumerate(drugs):
+            row = tk.Frame(body)
+            row.pack(fill="x", pady=fs(2))
+            cur = int(d.get("choice_group") or prev.get(d.get("idproduct"), 0) or 0)
+            v = tk.StringVar(value=opts[cur] if 0 <= cur < len(opts) else opts[0])
+            vars_.append(v)
+            ttk.Combobox(row, textvariable=v, values=opts, state="readonly",
+                         width=12, font=("Tahoma", fs(9))).pack(side="left")
+            tk.Label(row, text=d.get("drug1", "(ไม่มีชื่อ)"), font=("Tahoma", fs(10)),
+                     anchor="w", wraplength=fs(340), justify="left").pack(side="left", padx=fs(8))
+
+        result = {"ok": False}
+
+        def go():
+            result["ok"] = True
+            win.destroy()
+
+        row = tk.Frame(win)
+        row.pack(fill="x", padx=fs(14), pady=fs(12))
+        tk.Button(row, text="บันทึก", font=("Tahoma", fs(10), "bold"), bg="#1a7a4a", fg="white",
+                  command=go).pack(side="left")
+        tk.Button(row, text="ยกเลิก", font=("Tahoma", fs(10)),
+                  command=win.destroy).pack(side="left", padx=fs(8))
+        win.lift()
+        win.focus_force()
+        self.root.wait_window(win)
+        if not result["ok"]:
+            return None
+        return {i: opts.index(v.get()) for i, v in enumerate(vars_)}
+
+    def _ask_favorite_choices(self, name, entries):
+        """Favorite ที่มี "กลุ่มเลือก" - ถามก่อนว่าจะเอาตัวไหนในแต่ละกลุ่ม
+
+        คืน list ของยาที่จะโหลดจริง (ตัวคงที่ + ตัวที่เลือก) หรือ None ถ้ายกเลิก
+        Favorite เก่าที่ไม่มี choice_group จะไม่เข้าฟังก์ชันนี้เลย
+        """
+        groups = {}
+        fixed = []
+        for e in entries:
+            gid = e.get("choice_group") or 0
+            if gid:
+                groups.setdefault(int(gid), []).append(e)
+            else:
+                fixed.append(e)
+        if not groups:
+            return list(entries)
+
+        win = tk.Toplevel(self.root)
+        win.title(f"เลือกยา - {name}")
+        win.transient(self.root)
+        win.grab_set()
+        tk.Label(win, text=f"ชุด «{name}» มียาให้เลือก {len(groups)} กลุ่ม",
+                 font=("Tahoma", fs(11), "bold")).pack(anchor="w", padx=fs(14), pady=(fs(12), fs(2)))
+        if fixed:
+            tk.Label(win, text="ตัวคงที่: " + ", ".join(e.get("drug1", "") for e in fixed),
+                     font=("Tahoma", fs(9)), fg="#1a7a4a", wraplength=fs(430),
+                     justify="left").pack(anchor="w", padx=fs(14), pady=(0, fs(6)))
+
+        picks = {}
+        for gid in sorted(groups):
+            box = tk.LabelFrame(win, text=f" กลุ่มเลือก {gid} ", font=("Tahoma", fs(9), "bold"),
+                                padx=fs(8), pady=fs(4))
+            box.pack(fill="x", padx=fs(14), pady=fs(4))
+            var = tk.IntVar(value=0)          # 0 = ตัวแรก
+            picks[gid] = var
+            for i, e in enumerate(groups[gid]):
+                tk.Radiobutton(box, text=e.get("drug1", "(ไม่มีชื่อ)"), variable=var, value=i,
+                               font=("Tahoma", fs(10)), anchor="w", justify="left",
+                               wraplength=fs(400)).pack(anchor="w")
+            tk.Radiobutton(box, text="— ไม่เอาสักตัว —", variable=var, value=-1,
+                           font=("Tahoma", fs(9)), fg="#777", anchor="w").pack(anchor="w")
+
+        result = {"ok": False, "all": False}
+
+        def go():
+            result["ok"] = True
+            win.destroy()
+
+        def go_all():
+            """โหลดทุกตัวรวมตัวเลือกที่ไม่ได้เลือกด้วย - ทางเดียวที่จะแก้ชุดได้
+            เพราะปกติโหลดมาแค่ตัวที่เลือก พอกด 💾 บันทึกทับ ตัวเลือกอื่นจะหาย
+            (ก่อนหน้านี้ต้องสร้าง Favorite ใหม่ทั้งชุด)"""
+            result["ok"] = True
+            result["all"] = True
+            win.destroy()
+
+        row = tk.Frame(win)
+        row.pack(fill="x", padx=fs(14), pady=fs(12))
+        tk.Button(row, text="โหลดรายการนี้", font=("Tahoma", fs(10), "bold"),
+                  bg="#1a5a9a", fg="white", command=go).pack(side="left")
+        tk.Button(row, text="โหลดทุกตัว (แก้ไขชุด)", font=("Tahoma", fs(9)),
+                  command=go_all).pack(side="left", padx=fs(6))
+        tk.Button(row, text="ยกเลิก", font=("Tahoma", fs(10)),
+                  command=win.destroy).pack(side="left", padx=fs(8))
+        tk.Label(win, text="«โหลดทุกตัว» = เอาตัวเลือกทั้งหมดเข้ารายการ ไว้ลบ/เพิ่มตัวเลือก "
+                           "แล้วกด 💾 บันทึกทับชุดเดิม",
+                 font=("Tahoma", fs(8)), fg="#666", wraplength=fs(430),
+                 justify="left").pack(anchor="w", padx=fs(14), pady=(0, fs(10)))
+        win.lift()
+        win.focus_force()
+        self.root.wait_window(win)
+        if not result["ok"]:
+            return None
+        if result["all"]:
+            return list(entries)
+
+        chosen = list(fixed)
+        for gid in sorted(groups):
+            idx = picks[gid].get()
+            if idx >= 0 and idx < len(groups[gid]):
+                chosen.append(groups[gid][idx])
+        # เรียงตามลำดับเดิมใน Favorite - ตัวเลือกจะได้ไปอยู่ตำแหน่งที่ตั้งใจไว้
+        order = {id(e): i for i, e in enumerate(entries)}
+        chosen.sort(key=lambda e: order.get(id(e), 0))
+        return chosen
+
     def on_load_favorite(self, name):
         if name not in self.favorites:
             return
         saved_entries = [dict(e) for e in self.favorites[name]]
+        if any(e.get("choice_group") for e in saved_entries):
+            saved_entries = self._ask_favorite_choices(name, saved_entries)
+            if not saved_entries:
+                self.status_var.set("ยกเลิกการโหลด Favorite")
+                return
         self.status_var.set(f"กำลังโหลด Favorite '{name}'...")
 
         def worker():
@@ -2538,10 +2910,21 @@ class LabelApp(WarrantyMixin, KoryoMixin, ReferralMixin):
         # overwrote with the current global template). A drug that matches
         # the DB (or has no data at all) has nothing to protect, so it stays
         # non-override and keeps auto-refreshing from the DB as before.
+        groups = self._ask_favorite_groups(name)
+        if groups is None:
+            return
         snapshot = []
-        for d in self.selected_drugs:
+        for i, d in enumerate(self.selected_drugs):
             entry = dict(d)
             entry["override"] = d.get("status") == "edited"
+            # 0 = ตัวคงที่ / 1-3 = อยู่กลุ่มเลือก ตอนโหลดจะถามว่าเอาตัวไหนในกลุ่ม
+            # ต้องลบออกจาก entry ด้วยไม่ใช่แค่ d เพราะ entry ถูกก๊อปไว้ก่อนแล้ว
+            if groups.get(i):
+                entry["choice_group"] = int(groups[i])
+                d["choice_group"] = int(groups[i])
+            else:
+                entry.pop("choice_group", None)
+                d.pop("choice_group", None)
             snapshot.append(entry)
         self.favorites[name] = snapshot
         save_favorites(self.favorites)
@@ -2556,10 +2939,21 @@ class LabelApp(WarrantyMixin, KoryoMixin, ReferralMixin):
             return
         if not messagebox.askyesno("ยืนยัน", f"บันทึกทับ Favorite '{name}' ด้วยรายการปัจจุบันใช่ไหม?"):
             return
+        groups = self._ask_favorite_groups(name)
+        if groups is None:
+            return
         snapshot = []
-        for d in self.selected_drugs:
+        for i, d in enumerate(self.selected_drugs):
             entry = dict(d)
             entry["override"] = d.get("status") == "edited"
+            # 0 = ตัวคงที่ / 1-3 = อยู่กลุ่มเลือก ตอนโหลดจะถามว่าเอาตัวไหนในกลุ่ม
+            # ต้องลบออกจาก entry ด้วยไม่ใช่แค่ d เพราะ entry ถูกก๊อปไว้ก่อนแล้ว
+            if groups.get(i):
+                entry["choice_group"] = int(groups[i])
+                d["choice_group"] = int(groups[i])
+            else:
+                entry.pop("choice_group", None)
+                d.pop("choice_group", None)
             snapshot.append(entry)
         self.favorites[name] = snapshot
         save_favorites(self.favorites)
