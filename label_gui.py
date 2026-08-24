@@ -60,7 +60,7 @@ def save_favorites(favorites):
         json.dump(favorites, f, ensure_ascii=False, indent=2)
 
 
-APP_VERSION = "1.23.0"
+APP_VERSION = "1.24.0"
 
 DOTS_PER_MM = 8  # matches standard 203dpi thermal label printers
 
@@ -371,15 +371,61 @@ def fit_font(draw, text, max_width, start_size, bold=False, min_size=14, lang="t
 
 
 # This Pillow install has no libraqm (no Windows wheel ships it), so it can't
-# shape stacked Thai combining marks. Any base char that carries BOTH
-# mai-han-akat (ั) and a tone mark (่ ้ ๊ ๋) - e.g. "นั่น", "ทั้ง", "มั่นใจ",
-# "สั่ง" - draws both marks at the exact same font-designed anchor point and
-# the tone mark disappears underneath mai-han-akat. Fix: draw the base+ั
-# normally, then draw the tone mark by itself shifted up so it stacks above
-# instead of overlapping. Verified against สนั่น/ทั้งหมด/มั่นใจ/สั่งซื้อ/ทั่วไป
-# while leaving single-mark text (ก็/น้ำ/ชื่อ) unaffected.
-_MAI_HAN_AKAT = "ั"
+# shape stacked Thai combining marks. Three distinct failure modes found -
+# all stemming from the same underlying fact: a Thai tone-mark glyph (่ ้ ๊
+# ๋) is drawn by the font with a large NEGATIVE left-bearing (confirmed via
+# font.getbbox: at size 90, mai-ek's box is x=[-17,0], mai-tho's is
+# x=[-29,6] - roughly -0.2x/-0.32x font size) because it's designed to be
+# placed via OpenType GPOS mark-attachment onto whatever precedes it, not
+# drawn as a standalone glyph. Pillow's non-shaped "basic" layout can't do
+# that attachment, so drawing the mark "at the same x as the base" (the
+# naive fix) actually renders it shifted LEFT of the base and onto whatever
+# came before - not hidden, just wrong (this is what "ไม้เอกไปอยู่ที่ผู้"
+# turned out to be: ป's tone mark rendering on top of the preceding ผู้).
+# The reliable default fix is: draw the base cluster first, then the tone
+# mark at (x + full base width), which lets its own negative bearing pull
+# it back to sit above the base instead of spilling before it.
+#
+# 1) base + vowel-above (ั ิ ี ึ ื) + tone: e.g. "นั่น", "ที่", "ชื่อ",
+#    "หนึ่ง", "สี่" - base+vowel drawn as a cluster, tone drawn after it
+#    (right-attached, per above), lifted by 0.32x font size.
+# 2) ป/ฝ/ฟ + tone directly (no vowel between): e.g. "ป่วย", "ฝ่าย", "เฟ้อ" -
+#    their long loop/tail shape (bbox top ~9 at size 40 vs ~19 for a normal
+#    consonant like ค - confirmed via font.getbbox) needs the same 0.32x
+#    lift as case 1, unlike every other bare consonant (ค่า, ท่า, ก่อน, ไม่,
+#    ได้, น้ำ, ... - these already render correctly untouched with 0 shift).
+#    Unlike every other case, these three are explicitly CENTERED over the
+#    base (via _centered_tone_x, matching both bbox centers) rather than
+#    right-attached - user feedback specifically wanted only the
+#    long-tailed letters centered, everything else left at its current
+#    right-attached position since that already reads fine there.
+# 3) base + vowel-below (ุ ู) + tone: e.g. "ผู้", "รู้", "อยู่", "หนึ่ง"'s
+#    cousin "หมู่", "ปู่" - the below-vowel doesn't affect vertical
+#    placement, but the tone still needs positioning relative to the base
+#    (not the cluster) or it lands too far left; ป/ฝ/ฟ get the same
+#    centered treatment as case 2, everything else stays right-attached
+#    with a 0.20x lift.
+#
+# Verified at font sizes 40/90/150 against ป่วย/ฝ่าย/ฟ้า/เฟ้อ/ปิ่น/สี่/
+# หนึ่ง/ยื่น/ตื่น/ชื่อ/นี่/ที่/สนั่น/ผู้ป่วย/ชื่อผู้ป่วย/รู้/อยู่/ยุ่ง/หมู่/
+# ผู้/ปู่ (all three cases + the ป/ฝ/ฟ centering) and ค่า/ท่า/ก่อน/ไม่/ได้/
+# น้ำ (already-working, confirmed no regression) - this replaced an earlier
+# version of this fix that got cases 2 and 3 wrong (no x-shift at all, or a
+# wrong one) and only happened to look right at the specific small size it
+# was first tested at, and a version before that which missed ฟ entirely.
+_ABOVE_VOWELS = "ัิีึื็"
+_BELOW_VOWELS = "ุู"
 _TONE_MARKS = "่้๊๋"
+_TALL_CONSONANTS = "ปฝฟ"  # long tail/loop - need lift + centering even bare
+
+
+def _centered_tone_x(font, ref_char, tone):
+    """x-shift that centers tone's own ink bbox over ref_char's ink bbox -
+    only used for ป/ฝ/ฟ, where right-attaching (like every other case here)
+    visibly lands on the tip of their tail instead of over the letter."""
+    ref_l, _, ref_r, _ = font.getbbox(ref_char)
+    tone_l, _, tone_r, _ = font.getbbox(tone)
+    return (ref_l + ref_r) / 2 - (tone_l + tone_r) / 2
 
 
 def draw_thai_text(draw, xy, text, font, fill=0):
@@ -390,18 +436,51 @@ def draw_thai_text(draw, xy, text, font, fill=0):
     while i < n:
         ch = text[i]
         if (
-            i + 2 < n + 1 and i + 1 < n and text[i + 1] == _MAI_HAN_AKAT
-            and i + 2 < n and text[i + 2] in _TONE_MARKS
+            i + 2 < n and text[i + 1] in _ABOVE_VOWELS
+            and text[i + 2] in _TONE_MARKS
         ):
             base = ch
+            vowel = text[i + 1]
             tone = text[i + 2]
-            cluster = base + _MAI_HAN_AKAT
+            cluster = base + vowel
             draw.text((x, y), cluster, font=font, fill=fill)
             base_w = draw.textlength(base, font=font)
             lift = int(font.size * 0.32)
             draw.text((x + base_w, y - lift), tone, font=font, fill=fill)
             x += draw.textlength(cluster, font=font)
             i += 3
+            continue
+        if (
+            i + 2 < n and text[i + 1] in _BELOW_VOWELS
+            and text[i + 2] in _TONE_MARKS
+        ):
+            base = ch
+            belowv = text[i + 1]
+            tone = text[i + 2]
+            cluster = base + belowv
+            draw.text((x, y), cluster, font=font, fill=fill)
+            if base in _TALL_CONSONANTS:
+                x_shift = _centered_tone_x(font, base, tone)
+                lift = int(font.size * 0.32)
+                draw.text((x + x_shift, y - lift), tone, font=font, fill=fill)
+            else:
+                base_w = draw.textlength(base, font=font)
+                lift = int(font.size * 0.20)
+                draw.text((x + base_w, y - lift), tone, font=font, fill=fill)
+            x += draw.textlength(cluster, font=font)
+            i += 3
+            continue
+        if (
+            i + 1 < n and ch in _TALL_CONSONANTS
+            and text[i + 1] in _TONE_MARKS
+        ):
+            tone = text[i + 1]
+            draw.text((x, y), ch, font=font, fill=fill)
+            x_shift = _centered_tone_x(font, ch, tone)
+            lift = int(font.size * 0.32)
+            draw.text((x + x_shift, y - lift), tone, font=font, fill=fill)
+            x += draw.textlength(ch, font=font)
+            i += 2
             continue
         draw.text((x, y), ch, font=font, fill=fill)
         x += draw.textlength(ch, font=font)
@@ -770,14 +849,14 @@ def build_label_image(data, settings):
     draw.line([(x, y), (label_w_px - x, y)], fill=0, width=2)
     y += 10
 
-    def field(label, value, yy, label_font=f_normal, start_size=30, right_margin=0):
+    def field(label, value, yy, label_font=f_normal, start_size=30, right_margin=0, value_bold=True):
         # value is free-typed (patient name / drug name) - pick its font by
         # inspecting the actual characters, not the label-language dropdown.
         draw_thai_text(draw, (x, yy), label, label_font, fill=0)
         lw = draw.textlength(label, font=label_font)
         value_x = x + lw + 10
         max_w = label_w_px - x - right_margin - value_x
-        value_font = fit_font(draw, value or "", max_w, start_size, bold=True, lang=detect_font_lang(value))
+        value_font = fit_font(draw, value or "", max_w, start_size, bold=value_bold, lang=detect_font_lang(value))
         draw_thai_text(draw, (value_x, yy - 3), value or "", value_font, fill=0)
 
     QTY_RESERVED_W = 150
@@ -796,13 +875,19 @@ def build_label_image(data, settings):
     y += 34
     field(ls("drug_label", "ชื่อยา"), data["drug1"], y)
     y += 32
-    field(ls("generic_label", "ชื่อยาสามัญ"), data["drug2"], y)
-    y += 36
+    # Generic name is deliberately NOT bold (unlike patient name/drug1) and
+    # smaller (start_size 30/1.2=25) - the indication note just below IS
+    # bold, per user request: customers don't really focus on the generic/
+    # technical drug name, so the visual weight should go to what the drug
+    # is actually FOR instead. y-advance shrunk to match (36/1.2=30) so the
+    # smaller text doesn't leave a now-oversized gap before the next line.
+    field(ls("generic_label", "ชื่อยาสามัญ"), data["drug2"], y, start_size=25, value_bold=False)
+    y += 30
 
     if data.get("note"):
         # note is free-typed (indication/instructions) - same auto-detect
         # reasoning as patient_name/drug1/drug2 in field() above.
-        note_font = fit_font(draw, data["note"], label_w_px - 2 * x, 22, bold=False, min_size=16, lang=detect_font_lang(data["note"]))
+        note_font = fit_font(draw, data["note"], label_w_px - 2 * x, 22, bold=True, min_size=16, lang=detect_font_lang(data["note"]))
         draw_thai_text(draw, (x, y), data["note"], note_font, fill=0)
         y += 28
 

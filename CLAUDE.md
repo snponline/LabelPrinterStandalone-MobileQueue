@@ -79,6 +79,29 @@ per-conversation).
 `APP_VERSION` in `label_gui.py` (shown in the window title bar) — bump it whenever a commit ships
 a user-visible feature/fix batch, since there's no other version indicator in this app.
 
+- **1.24.0** — Fixed Thai tone marks (่ ้ ๊ ๋) rendering wrong or invisible on printed labels
+  (customer-reported: "ป่วย" printed as "ปวย" in ชื่อผู้ป่วย). Root cause: this Pillow install has
+  no libraqm, so it can't do OpenType mark-attachment shaping - `draw_thai_text()`'s existing
+  workaround only covered one narrow combining pattern (ั + tone). Rewrote it to cover three
+  failure modes found by testing real words: (1) ANY vowel-above mark (ิ ี ึ ื, not just ั) stacked
+  with a tone mark - ที่/นี่/ชื่อ/หนึ่ง/สี่ were all silently broken; (2) ป/ฝ/ฟ's long loop/tail
+  swallowing a direct tone mark - ป่วย/ฝ่าย/เฟ้อ; (3) a below-vowel (ุ/ู) between base and tone -
+  ผู้/รู้/อยู่/ปู่. All three needed the tone mark's own large negative left-bearing (confirmed via
+  `font.getbbox` - it's designed for GPOS attachment, not standalone drawing) compensated for by
+  positioning after the full base width, not at the same x - an earlier iteration of this exact fix
+  session got that wrong and only looked right at the specific small test size it was first tried
+  at. Per follow-up user feedback, ป/ฝ/ฟ specifically get the tone mark CENTERED over the letter
+  (`_centered_tone_x`, matching ink-bbox centers) rather than right-attached like every other case,
+  since their tail is long enough that right-attaching visibly lands on the tip instead of the
+  letter. Verified at font sizes 40/90/150 against every case above plus the already-working ones
+  (ค่า, ท่า, ก่อน, ไม่, ได้, น้ำ, สนั่น) to confirm no regression. Ported identically to HOPE's two
+  builds (`label_printer`, `label_printer_snpvps`) and `LabelPrinterStandalone` in the same session,
+  since all four share the exact same `draw_thai_text()`.
+  Also, per user feedback: the generic-name field (`ชื่อยาสามัญ`) is now non-bold and smaller
+  (`start_size` 30→25) since customers don't focus on the technical drug name, while the indication
+  note just below it (e.g. "ลดกรด") is now bold instead - a deliberate swap of which line gets the
+  visual weight. `field()` gained a `value_bold` parameter (default `True`, unchanged for patient
+  name/drug1) to make this a per-call override rather than a global change.
 - **1.22.0** — ใบส่งต่อผู้ป่วย (PhRF), ported from HOPE as `referral_ui.py` + a `📨 ส่งต่อ` toolbar
   button. Renderers and symptom picker carried over verbatim, so a referral written here prints
   identically to one written on the desktop; the data layer underneath is SQLite (`referrals`
